@@ -1,6 +1,10 @@
 # Generation results
 results/
-
+*.pkl
+*.npy
+*.json
+*.pth
+trained_models/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

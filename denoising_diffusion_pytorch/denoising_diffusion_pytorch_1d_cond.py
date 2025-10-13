@@ -364,7 +364,6 @@ class ConditionalUnet1D(nn.Module):
         super().__init__()
         all_dims = [input_dim] + list(down_dims)
         start_dim = down_dims[0]
-
         dsed = diffusion_step_embed_dim
         diffusion_step_encoder = nn.Sequential(
             SinusoidalPosEmb(dsed),
@@ -449,6 +448,7 @@ class ConditionalUnet1D(nn.Module):
         self.up_modules = up_modules
         self.down_modules = down_modules
         self.final_conv = final_conv
+        self.out_channels = input_dim
 
     def forward(self, 
             sample: torch.Tensor, 
@@ -479,7 +479,7 @@ class ConditionalUnet1D(nn.Module):
             global_feature = torch.cat([
                 global_feature, global_cond
             ], axis=-1)
-        
+
         # encode local features
         h_local = list()
         if local_cond is not None:
@@ -668,6 +668,7 @@ class TransformerForDiffusion(nn.Module):
         self.local_obs_as_cond = local_obs_as_cond
         self.global_obs_as_cond = global_obs_as_cond
         self.encoder_only = encoder_only
+        self.out_channels = input_dim
 
         # init
         self.apply(self._init_weights)
@@ -911,7 +912,7 @@ class GaussianDiffusion1DConditional(Module):
     ):
         super().__init__()
         self.model = model
-        self.channels = 3 #self.model.out_channels
+        self.channels = self.model.out_channels
         self.self_condition = False # Brutally set up the value #self.model.self_condition
 
         self.seq_length = seq_length
