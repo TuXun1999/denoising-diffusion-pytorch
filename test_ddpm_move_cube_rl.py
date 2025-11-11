@@ -1,7 +1,8 @@
 import torch
 
 from denoising_diffusion_pytorch import ConditionalUnet1D, \
-    GaussianDiffusion1DConditional, Trainer1DCond, Dataset1DCond, TransformerForDiffusion
+    GaussianDiffusion1DConditionalRL, Trainer1DCondRL, Dataset1DCond,\
+        TransformerForDiffusion, RewardModel, NaiveCriticModel
 import numpy as np
 import matplotlib.pyplot as plt
 import open3d as o3d
@@ -19,7 +20,7 @@ def select_closest_sample(matrix, array):
 
 def se2norm(array):
     # Find the norm of a se2 vector; use l2 norm temporarily
-    return torch.norm(array[0:2]) + 0.36 * torch.norm(array[2])
+    return torch.sqrt(array[0]**2 + array[1]**2) + 0.6 * torch.norm(array[2])
 
 def SE2ToSE3(vector):
     '''
@@ -37,12 +38,18 @@ obs_length = 3
 obs_dim = 3
 seq_length = 4
 action_dim = 3
+action_repeat = 5
 
 option = 'unet1d'  # Model hierarchy
 '''
 NOTE: Look at only object poses
 '''
 if option == "unet1d":
+    model_baseline = ConditionalUnet1D(
+        input_dim = action_dim,
+        local_cond_dim = 1,
+        global_cond_dim = obs_length * obs_dim,
+    )
     model = ConditionalUnet1D(
         input_dim = action_dim,
         local_cond_dim = 1,
@@ -57,12 +64,20 @@ else:
         global_cond_dim = 2 * obs_length * obs_dim
     )
 
-diffusion = GaussianDiffusion1DConditional(
+diffusion_baseline = GaussianDiffusion1DConditionalRL(
+    model_baseline,
+    seq_length = seq_length,
+    timesteps = 10,
+    sampling_timesteps = 8, 
+    ddim_sampling_eta = 1.0,
+    objective = 'pred_noise'
+)
+diffusion = GaussianDiffusion1DConditionalRL(
     model,
     seq_length = seq_length,
-    timesteps = 20,
-    sampling_timesteps = 18,
-    ddim_sampling_eta = 1.0,
+    timesteps = 10,
+    sampling_timesteps = 8,
+    ddim_sampling_eta = 1.0, 
     objective = 'pred_noise'
 )
 
@@ -84,8 +99,6 @@ global_label = []
 local_label = []
 rewards = []
 next_states = []
-done_signals = []
-
 for i in range(len(gripper_poses)):
     gripper_poses_one_demo = gripper_poses[i][::8] # time_steps x 3
     object_poses_one_demo = object_poses[i][::8] # time_steps x 3
@@ -95,8 +108,8 @@ for i in range(len(gripper_poses)):
     # poses_one_demo = poses_one_demo[poses_unique_idx]
     demo_length = poses_one_demo.shape[0]
     
-    for j in range(obs_length-1, demo_length-seq_length-1):
-    # for j in range(obs_length - 1, demo_length - 2):
+    # for j in range(obs_length-1, demo_length-seq_length-1):
+    for j in range(obs_length - 1, demo_length - 2):
         # Extract out the observations
         obs_gripper = poses_one_demo[j-obs_length+1:j+1, 0:action_dim].flatten()
         assert obs_gripper.shape[0] == obs_length * action_dim, "incorrect shape: " + str(obs_gripper.shape[0])
@@ -108,7 +121,12 @@ for i in range(len(gripper_poses)):
         action = poses_one_demo[j+1, 0:action_dim] - poses_one_demo[j, 0:action_dim]
         action = np.tile(action, (seq_length, 1))
         assert action.shape[0] == seq_length and action.shape[1] == action_dim, "incorrect shape: " + str(action.shape[0])
-        traj_noisy.append(action)
+        
+        # Add some noises to the action
+        for i in range(action_repeat):
+            noise = np.random.normal(0, 0.1, size=action.shape)
+            action = action + noise
+            traj_noisy.append(action)
 
         '''
         NOTE: Look at both gripper pose & object pose => strange RL behaviors
@@ -116,7 +134,14 @@ for i in range(len(gripper_poses)):
         '''
         # obs = np.concatenate([obs_gripper, obs_obj], axis=-1)
         obs = obs_obj
-        global_label.append(obs)
+        for i in range(action_repeat):
+            global_label.append(obs)
+        
+        reward = se2norm(torch.from_numpy(poses_one_demo[j+1, action_dim:]))# reward
+        state_score = se2norm(torch.from_numpy(obs_obj[-3:]))# state
+        # NOTE: add log to encourage larger rewards
+        for i in range(action_repeat):
+            rewards.append(1000 * (-reward + state_score))
 
         # Extra attributes for RL: reward & next state & done
         next_obs_gripper = poses_one_demo[j-obs_length+2:j+2, 0:action_dim].flatten()# next state
@@ -128,14 +153,8 @@ for i in range(len(gripper_poses)):
         '''
         next_obs = next_obs_obj
         # next_obs = np.concatenate([next_obs_gripper, next_obs_obj], axis=-1)
-        
-        next_states.append(next_obs)
-
-        reward = -se2norm(torch.from_numpy(poses_one_demo[j+1, action_dim:]))# reward
-        rewards.append(reward)
-
-        done = reward > -0.05
-        done_signals.append(done)
+        for i in range(action_repeat):
+            next_states.append(next_obs)
 
         
 
@@ -146,9 +165,8 @@ for i in range(len(gripper_poses)):
 traj_noisy = np.array(traj_noisy)
 traj_noisy = np.transpose(traj_noisy, [0, 2, 1])
 global_label = np.array(global_label)
-next_states = np.array(next_states)
 rewards = np.array(rewards)
-done_signals = np.array(done_signals)
+
 print(traj_noisy.shape)
 print(global_label.shape)
 # It seems that the local label is not used
@@ -158,12 +176,10 @@ local_label = np.zeros((global_label.shape[0], 1, seq_length))
 traj_noisy = torch.from_numpy(np.float32(traj_noisy))
 global_label = torch.from_numpy(np.float32(global_label))
 local_label = torch.from_numpy(np.float32(local_label))
-next_states = torch.from_numpy(np.float32(next_states))
 rewards = torch.from_numpy(np.float32(rewards))
-done_signals = torch.from_numpy(done_signals)
 
-# Visualize some of the data
-vis_select_idx = 32 #np.random.randint(0, len(gripper_poses)) # The index of the demo to evaluate
+# Visualize some of the data (32: important)
+vis_select_idx = np.random.randint(0, len(gripper_poses)) # The index of the demo to evaluate
 print(vis_select_idx)
 '''
 NOTE: now, look at both object poses and gripper poses => RL behaves strangely
@@ -175,8 +191,7 @@ vis_demo_start = object_poses[vis_select_idx][0]
 vis_demo_start = np.tile(vis_demo_start, (obs_length, ))
 
 select_idx = select_closest_sample(global_label, vis_demo_start)# The index of the starting location in global_label
-print(vis_demo_start)
-print(global_label[select_idx])
+
 
 object_pose_test = object_poses[vis_select_idx]
 
@@ -232,34 +247,108 @@ normalization_stats = {
     "actions": actions,
     "local_label": local_label,
     "global_label": global_label,
-    "next_states": next_states,
-    "rewards": rewards,
-    "done_signals": done_signals
 }
-torch.save(normalization_stats, "normalization_stats.pth")
+# torch.save(normalization_stats, "normalization_stats.pth")
+# rewarding_model = RewardModel(
+#     state_dim = obs_length * obs_dim + action_dim,
+#     v_min = v_min, v_max = v_max, \
+#     angular_v_max = angular_v_max, angular_v_min = angular_v_min,\
+#     device="cuda:0")
+# rewarding_model.load_dataset(states = global_label, actions = actions[:, :, 0], rewards = rewards)
+# rewarding_model.train()
+# rewarding_model.save_model(path="./results/rewarding_model.pth")
+# rewarding_model.model.eval()
 
-trainer = Trainer1DCond(
+rewarding_model = NaiveCriticModel(scale = 0.6, v_min = v_min, v_max = v_max, \
+    angular_v_max = angular_v_max, angular_v_min = angular_v_min,\
+    device="cuda:0")
+
+
+with torch.no_grad():
+    print("Test the rewarding model")
+    idx = 156 #np.random.randint(0, global_label.shape[0])
+    print(idx)
+    sample_state = global_label[idx]
+    sample_action = actions[idx][:, 0]
+    sample_reward = rewards[idx]
+    print("Ground-truth reward: ")
+    print(sample_reward)
+    print(sample_state)
+    print(sample_action)
+
+    print(rewarding_model(sample_state.unsqueeze(0).to(rewarding_model.device), \
+        training_sq[idx].unsqueeze(0).to(rewarding_model.device)))
+    reward_math = sample_state[-3:]
+    reward_math = reward_math + sample_action
+    reward_math = -se2norm(reward_math) + se2norm(sample_state[-3:])
+    print(10 * reward_math)
+
+
+is_wandb = True
+if is_wandb:
+    import wandb
+    project="object-moving-se2"
+    config = {
+        "RL algorithm": "PPO",
+        "dataset": "banana",
+        "batch_size": 32,
+        "old-policy": "new",
+        "epochs": 500,
+    }
+    wandb_logger = wandb.init(project=project, config=config)
+else:
+    wandb_logger = None
+trainer = Trainer1DCondRL(
+    diffusion_baseline, 
     diffusion,
     dataset = dataset,
     train_batch_size = 32,
     train_lr = 8e-5,
     train_num_steps = 5000,         # total training steps
+    PPO_train_num_steps= 2000,
     gradient_accumulate_every = 2,    # gradient accumulation steps
     ema_decay = 0.995,                # exponential moving average decay
     amp = True,                       # turn on mixed precision
-    save_and_sample_every=100000      # Force not to save the sample result
+    save_and_sample_every=100000,      # Force not to save the sample result
+    
+    # RL rewarding model
+    rewarding_model= rewarding_model,
+    
+    # wandb logger
+    wandb_logger = wandb_logger
 )
-load_prev = False# Set to True if you want to load the previous model
-# Not Load the previous model
-if not load_prev:
-    trainer.train()
-    # Save the statistics
-    trainer.save(1)
-else:
-    trainer.load(1)
 
+# Mode (max-reward action selected by default)
+# train_ddpm: train the ddpm (without RL)
+# load_ddpm: load the trained ddpm (without RL)
+# train_ddpm_ppo: load the trained ddpm, and finetune it with PPO
+# load_ddpm_ppo: load the finetuned ddpm
+training_mode = "train_ddpm_ppo"
+# Not Load the previous model
+if training_mode == "train_ddpm":
+    trainer.train()
+    trainer.save(1)
+elif training_mode == "load_ddpm":
+    trainer.load(1)
+elif training_mode == "train_ddpm_ppo":
+    trainer.load(1)
+    trainer.finetune_PPO()
+    trainer.save(2)
+elif training_mode == "load_ddpm_ppo":
+    trainer.load(2)
+else:
+    assert False, "Unknown training mode"
 # after a lot of training
 
+
+# angle = 2 * np.pi * np.random.random()
+# obj_x = 0.3 * np.cos(angle)
+# obj_y = 0.3 * np.sin(angle)
+# theta = 2 * np.pi * np.random.random()
+# pose = torch.tensor([obj_x, obj_y, theta])
+# pose = pose.repeat(3)
+# pose = pose.to(torch.float32)
+# print(pose)
 frame_poses = []
 batch_size_sample = 10
 global_label_sample = torch.tile(global_label[select_idx], (batch_size_sample, 1)) # (2 x obs_length x obs_dim)
@@ -273,26 +362,30 @@ obs_pose = global_label[select_idx][-obs_dim:]
 #     [global_label[select_idx][(obs_length - 1) * action_dim : obs_length * action_dim],
 #      global_label[select_idx][-obs_dim:]])
 steps = 0
-print("**** Visualization Check ****")
-print(obs_pose)
-print(global_label[select_idx])
-print(traj_noisy[0])
 while True:
     steps += 1
     frame_poses.append(obs_pose.numpy()) # obs_length x obs_dim x 1
     # print(local_label_sample.shape)
     # print(global_label_sample.shape)
+    
+    # Finetune the model with PPO at first
+    # trainer.finetune_PPO(\
+    #     action_gt = None, \
+    #     local_cond = local_label_sample[0],\
+    #     global_cond = global_label_sample[0])
+    # # Copy the parameters
+    # trainer.model_baseline.load_state_dict(trainer.model.state_dict())
+    
+    # Sample from the diffusion model
     sampled_seq = diffusion.sample(batch_size = batch_size_sample, \
-            local_cond = local_label_sample.to(device="cuda:0"), global_cond = global_label_sample.to(device="cuda:0"))
+            local_cond = local_label_sample.to(trainer.device), global_cond = global_label_sample.to(trainer.device))
     # print("==Initial Check===")
     # print(sampled_seq.shape)
     # print(sampled_seq[0])
-    # print(sampled_seq[1])
-    # print(sampled_seq[2])
-    
     # print("==Inverse the mapping and check the plot==")
     # traj_recon = torch.mean(sampled_seq, dim = 0)
-    traj_recon = sampled_seq[0]
+    rewards = rewarding_model(global_label_sample.to(trainer.device), sampled_seq).squeeze() # (B, )
+    traj_recon = sampled_seq[torch.argmax(rewards), :]
     traj_recon = traj_recon.to(device='cpu') # DxT
     torch.cuda.synchronize()
 
@@ -348,7 +441,7 @@ while True:
     # The action is applied on the gripper, but the object needs to updated differently
     # last_object_pose += action
     last_object_pose[0:2] += action[0:2] # Update the position
-    last_object_pose[2] -= action[2] # Update the angle
+    last_object_pose[2] += action[2] # Update the angle
     
     obs_object_pose = global_label_sample[0][obs_dim :]
     obs_object_pose = torch.concatenate((obs_object_pose, last_object_pose))
@@ -360,7 +453,10 @@ while True:
 
     # Determine whether to exit
     if se2norm(last_object_pose) < 0.03 or steps >= 40:
+        print("Final object pose: ")
         print(last_object_pose)
+        print("Final timesteps: ")
+        print(steps)
         break
 
     # Stack global_label_sample
@@ -393,3 +489,4 @@ for item in frame_poses:
 vis.run()
 # Close all windows
 vis.destroy_window()
+

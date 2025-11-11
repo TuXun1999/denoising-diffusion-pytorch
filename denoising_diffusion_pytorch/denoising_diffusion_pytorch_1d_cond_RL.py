@@ -1,6 +1,6 @@
 import math
 from pathlib import Path
-from random import random
+import random
 from functools import partial
 from collections import namedtuple
 from typing import Union, Optional, Tuple
@@ -13,7 +13,7 @@ from torch.nn import Module, ModuleList
 import torch.nn.functional as F
 from torch.amp import autocast
 from torch.optim import Adam
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, TensorDataset
 
 from einops import rearrange, reduce
 from einops.layers.torch import Rearrange
@@ -294,7 +294,7 @@ class Attention(Module):
         out = rearrange(out, 'b h n d -> b (h d) n')
         return self.to_out(out)
 
-# model
+# model 
 class ConditionalResidualBlock1D(nn.Module):
     def __init__(self, 
             in_channels, 
@@ -349,7 +349,7 @@ class ConditionalResidualBlock1D(nn.Module):
         out = out + self.residual_conv(x)
         return out
 
-
+# (backbone 1: residual unet)
 class ConditionalUnet1D(nn.Module):
     def __init__(self, 
         input_dim,
@@ -897,7 +897,7 @@ def cosine_beta_schedule(timesteps, s = 0.008):
     betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
     return torch.clip(betas, 0, 0.999)
 
-class GaussianDiffusion1DConditional(Module):
+class GaussianDiffusion1DConditionalRL(Module):
     def __init__(
         self,
         model,
@@ -908,13 +908,16 @@ class GaussianDiffusion1DConditional(Module):
         objective = 'pred_noise',
         beta_schedule = 'cosine',
         ddim_sampling_eta = 0.,
-        auto_normalize = True
+        auto_normalize = True,
+        combine_DDPO_MSE = False,
     ):
         super().__init__()
         self.model = model
         self.channels = self.model.out_channels
         self.self_condition = False # Brutally set up the value #self.model.self_condition
-
+        self.combine_DDPO_MSE = combine_DDPO_MSE
+        self.mse_loss_coef = 0.5 if combine_DDPO_MSE else 0.0
+        self.clip_range = 2e-1
         self.seq_length = seq_length
 
         self.objective = objective
@@ -1057,7 +1060,7 @@ class GaussianDiffusion1DConditional(Module):
 
         return ModelPrediction(pred_noise, x_start)
 
-    
+    # TODO: understand the codes here
     def p_mean_variance(self, x, t, local_cond = None, global_cond = None, \
                         x_self_cond = None, clip_denoised = True):
         preds = self.model_predictions(x, t, local_cond, global_cond, x_self_cond)
@@ -1065,14 +1068,14 @@ class GaussianDiffusion1DConditional(Module):
 
         if clip_denoised:
             x_start.clamp_(-1., 1.)
-
+        # Formula (6) in https://arxiv.org/pdf/2006.11239
         model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start = x_start, x_t = x, t = t)
         return model_mean, posterior_variance, posterior_log_variance, x_start
 
     @torch.no_grad()
     def p_sample(self, x, t: int, \
                  local_cond = None, global_cond = None, \
-                    x_self_cond = None, clip_denoised = True):
+                    x_self_cond = None, clip_denoised = True, img_prev = None):
         b, *_, device = *x.shape, x.device
         batched_times = torch.full((b,), t, device = x.device, dtype = torch.long)
         model_mean, _, model_log_variance, x_start = self.p_mean_variance(\
@@ -1080,69 +1083,174 @@ class GaussianDiffusion1DConditional(Module):
             local_cond = local_cond, global_cond = global_cond,\
             x_self_cond = x_self_cond, clip_denoised = clip_denoised)
         noise = torch.randn_like(x) if t > 0 else 0. # no noise if t == 0
-        pred_img = model_mean + (0.5 * model_log_variance).exp() * noise
-        return pred_img, x_start
-
+        sigma = (0.5 * model_log_variance).exp()
+        # TODO: further understand the mathematics here & return log scores as well
+        if prev_img is None:
+            prev_img = model_mean + sigma * noise
+        pred_img_prev = prev_img.clone()
+        
+        # Calculate the log probabilities
+        log_prob = (
+            -((prev_img - model_mean) ** 2) /  (2 * (sigma**2))
+            - math.log(sigma)
+            - math.log(math.sqrt(2 * math.pi))
+        )
+        # Mean over each individual "pixel" (assume indpendence between "pixels")
+        log_prob = torch.mean(log_prob, axis=tuple(range(1, log_prob.ndim)))
+        return pred_img_prev, x_start, log_prob
+    """
+    Modify the two sampling functions so that they can return log probability scores 
+    as well
+    """
     @torch.no_grad()
-    def p_sample_loop(self, shape, local_cond = None, global_cond = None):
+    def p_sample_loop(self, shape, local_cond = None, global_cond = None, verbose = False):
         batch, device = shape[0], self.betas.device
 
         img = torch.randn(shape, device=device)
         local_cond = local_cond.to(device)
         global_cond = global_cond.to(device)
         x_start = None
-
-        for t in tqdm(reversed(range(0, self.num_timesteps)), desc = 'sampling loop time step', total = self.num_timesteps):
+        if verbose is True:
+            ts_lst = []
+            img_lst = []
+            img_next_lst = []
+            log_probs_lst = []
+        #for t in tqdm(reversed(range(0, self.num_timesteps)), desc = 'sampling loop time step', total = self.num_timesteps):
+        for t in reversed(range(0, self.num_timesteps)):
             self_cond = x_start if self.self_condition else None
-            img, x_start = self.p_sample(img, t, local_cond, global_cond, self_cond)
+            if verbose is True:
+                img_lst.append(img)
+            img, x_start, log_prob = self.p_sample(img, t, local_cond, global_cond, self_cond)
+            
+            if verbose is True:
+                img_next_lst.append(img)
+                ts_lst.append(t)
+                log_probs_lst.append(log_prob)
 
         img = self.unnormalize(img)
+        
+        if verbose is True:
+            # Transform the shapes:
+            # img_lst, img_next_lst into shape (B, ts, D, T)
+            # ts_lst into shape (B, ts)
+            img_lst = torch.stack(img_lst).to(device).permute(1, 0, 2, 3)
+            img_next_lst = torch.stack(img_next_lst).to(device).permute(1, 0, 2, 3)
+            log_probs_lst = torch.stack(log_probs_lst).to(device).permute(1, 0)
+            
+            # Already of the length sampling_timesteps
+            ts_lst = torch.broadcast_to(ts_lst, (img_lst.shape[0], ts_lst.shape[0]))
+            # Unnormalize img_lst & img_next_lst
+            img_lst = self.unnormalize(img_lst)
+            img_next_lst = self.unnormalize(img_next_lst)
+        
+            return img, img_lst, img_next_lst, ts_lst, log_probs_lst
         return img
-
     @torch.no_grad()
-    def ddim_sample(self, shape, local_cond, global_cond, clip_denoised = True):
+    def ddim_sample_step(self, eta, time, time_next, x_start, pred_noise, img_prev = None):
+        """
+        Function to do one step of sampling in DDIM
+        """
+        # Check formula (12) from https://arxiv.org/pdf/2010.02502.pdf (DDIM)
+        alpha = self.alphas_cumprod[time]
+        alpha_next = self.alphas_cumprod[time_next]
+
+        sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
+        c = (1 - alpha_next - sigma ** 2).sqrt()
+
+        
+        # Predict the mean of the previous sample
+        img_prev_mean = x_start * alpha_next.sqrt() + c * pred_noise
+       
+        
+        # Follow the formula
+        if img_prev is None:
+            noise = torch.randn_like(x_start)
+            img_prev =  img_prev_mean + sigma * noise
+
+        # Understand the mathematics & finalize the function to return the list of log_prob as well
+        log_prob = (
+            -((img_prev - img_prev_mean) ** 2) / (2 * (sigma**2))
+            - math.log(sigma)
+            - math.log(math.sqrt(2 * math.pi))
+        )
+        # Mean over each individual "pixel" (assume indpendence between "pixels")
+        log_prob = torch.mean(log_prob, axis=tuple(range(1, log_prob.ndim)))
+        
+        img = img_prev.clone()
+        return img, x_start, log_prob
+    
+    @torch.no_grad()
+    def ddim_sample(self, shape, local_cond, global_cond, clip_denoised = True, verbose = False):
         batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.betas.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
 
         times = torch.linspace(-1, total_timesteps - 1, steps=sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
         times = list(reversed(times.int().tolist()))
         time_pairs = list(zip(times[:-1], times[1:])) # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
 
+        # The sample to genereta
         img = torch.randn(shape, device = device)
 
+        # The predicted initial sample
         x_start = None
-
-        for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
+        if verbose is True:
+            ts_lst = []
+            img_lst = []
+            img_next_lst = []
+            log_probs_lst = []
+        # for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
+        for time, time_next in time_pairs:
             time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
+            if verbose is True:
+                ts_lst.append(torch.tensor(time))
+                img_lst.append(img)
             self_cond = x_start if self.self_condition else None
             pred_noise, x_start, *_ = self.model_predictions(img, time_cond, \
                                         local_cond, global_cond, self_cond, clip_x_start = clip_denoised)
 
-            if time_next < 0:
+            if time_next < 0: 
+                # At the final stage, the predicted sample is the inital sample
                 img = x_start
                 continue
+            img, _, log_prob = self.ddim_sample_step(eta, time, time_next, x_start, pred_noise, img_prev = None)
+            if verbose is True:
+                img_next_lst.append(img)
+                log_probs_lst.append(log_prob)
+        # Parameters to return: latents, latents_lst, next_latents_lst, ts_lst, log_probs_lst, images
 
-            alpha = self.alphas_cumprod[time]
-            alpha_next = self.alphas_cumprod[time_next]
-
-            sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
-            c = (1 - alpha_next - sigma ** 2).sqrt()
-
-            noise = torch.randn_like(img)
-
-            img = x_start * alpha_next.sqrt() + \
-                  c * pred_noise + \
-                  sigma * noise
-
-        img = self.unnormalize(img)
+        # The final generated sample (also the first initial sample)
+        img = self.unnormalize(img) # (B, D, T)
+        
+        if verbose is True:
+            # Transform the shapes:
+            # img_lst, img_next_lst into shape (B, ts, D, T)
+            # ts_lst into shape (B, ts)
+            img_lst = torch.stack(img_lst).to(device).permute(1, 0, 2, 3)
+            img_next_lst = torch.stack(img_next_lst).to(device).permute(1, 0, 2, 3)
+            log_probs_lst = torch.stack(log_probs_lst).to(device).permute(1, 0)
+            ts_lst = torch.stack(ts_lst).to(device)
+            # Already of the length sampling_timesteps
+            ts_lst = torch.broadcast_to(ts_lst, (img_lst.shape[0], ts_lst.shape[0]))
+            # Unnormalize img_lst & img_next_lst
+            img_lst = self.unnormalize(img_lst)
+            img_next_lst = self.unnormalize(img_next_lst)
+        
+            return img, img_lst, img_next_lst, ts_lst, log_probs_lst
         return img
 
     @torch.no_grad()
-    # TODO: figure out how to add condition to sampling
     def sample(self,  batch_size = 16, local_cond = None, global_cond = None):
         seq_length, channels = self.seq_length, self.channels
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
         return sample_fn((batch_size, channels, seq_length), local_cond, global_cond)
-
+    
+    
+    @torch.no_grad()
+    def sample_verbose(self, batch_size = 16, local_cond = None, global_cond = None):
+        seq_length, channels = self.seq_length, self.channels
+        sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
+        return sample_fn((batch_size, channels, seq_length), local_cond, global_cond, verbose=True)
+    
+    
     @torch.no_grad()
     def interpolate(self, x1, x2, t = None, lam = 0.5):
         b, *_, device = *x1.shape, x1.device
@@ -1177,7 +1285,7 @@ class GaussianDiffusion1DConditional(Module):
         noise = default(noise, lambda: torch.randn_like(x_start))
 
         # noise sample
-        # NOTE: no need to add conditions here
+        # NOTE: no need to add conditions here (sample the random timesteps)
         x = self.q_sample(x_start = x_start, t = t, noise = noise)
 
         # if doing self-conditioning, 50% of the time, predict x_start from current set of times
@@ -1185,7 +1293,7 @@ class GaussianDiffusion1DConditional(Module):
         # this technique will slow down training by 25%, but seems to lower FID significantly
 
         x_self_cond = None
-        if self.self_condition and random() < 0.5:
+        if self.self_condition and random.random() < 0.5:
             with torch.no_grad():
                 x_self_cond = self.model_predictions(x, t, local_cond, global_cond).pred_x_start
                 x_self_cond.detach_()
@@ -1209,7 +1317,8 @@ class GaussianDiffusion1DConditional(Module):
 
         loss = loss * extract(self.loss_weight, t, loss.shape)
         return loss.mean()
-
+    
+    
     def forward(self, img, local_cond = None, global_cond = None, *args, **kwargs):
         b, c, n, device, seq_length, = *img.shape, img.device, self.seq_length
         assert n == seq_length, f'seq length must be {seq_length}'
@@ -1217,19 +1326,400 @@ class GaussianDiffusion1DConditional(Module):
 
         img = self.normalize(img)
         return self.p_losses(img, t, local_cond, global_cond, *args, **kwargs)
+    
+    def forward_ppo_loss(self, img, local_cond = None, global_cond = None, *args, **kwargs):
+        if img is not None:
+            b, c, n, device, seq_length, = *img.shape, img.device, self.seq_length
+            assert n == seq_length, f'seq length must be {seq_length}'
+            img = self.normalize(img)
+        else:
+            b = global_cond.shape[0]
+            device = global_cond.device
+        t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
 
+        
+
+        img_lst = kwargs["img_lst"] # Shape: (B, ts, D, T)
+        img_next_lst = kwargs["img_next_lst"] # Shape: (B, ts, D, T)
+        ts_lst = kwargs["ts_lst"] # Shape: (B, ts)
+        log_probs_lst = kwargs["log_probs_lst"] # Shape: (B, ts)
+
+        advantages = kwargs["advantages"] # Shape: (B, )
+        
+        logger = kwargs["logger"]
+        
+        train_steps = 5
+        total_loss = 0
+        # for i in random.sample(range(img_next_lst.shape[1]), k=train_steps):  # img_lst.shape: torch.Size([6, 10, 4, 64, 64])
+        for i in range(img_next_lst.shape[1]):
+            img_i, img_next_i, t_i = img_lst[:, i], img_next_lst[:, i], ts_lst[:, i]
+            # Normalize the inputs
+            img_i = self.normalize(img_i)
+            img_next_i = self.normalize(img_next_i)
+
+            # Prepare the inputs (TODO: classifier-free guidance?)
+            img_old_model_noisy = img_i
+            t_input = t_i
+            if self.combine_DDPO_MSE is True:
+                # Get the ground-truth image
+                img_gt = img
+
+                # Generate noisy samples from the ground-truth image
+                noise = default(noise, lambda: torch.randn_like(img_gt))
+
+                # noise sample
+                # NOTE: no need to add conditions here
+                # We are adding noise to the original sample for a noisy sample
+                img_gt_noisy = self.q_sample(x_start = img_gt, t = t_input, noise = noise)
+
+
+                if self.self_condition:
+                    raise NotImplementedError("DDPO with self-conditioning is not implemented yet.")
+                
+                
+                # Get the target for loss depending on the prediction type
+                if self.objective == 'pred_noise':
+                    target = noise
+                # elif self.objective == 'pred_x0':
+                #     target = x_start
+                # elif self.objective == 'pred_v':
+                #     v = self.predict_v(x_start, t, noise)
+                #     target = v
+                else:
+                    raise ValueError(f'unknown objective {self.objective} (only pred_noise is supported currently)')
+
+                
+                # Predict the noise residual and compute loss
+                noise_pred_old_model, x_start, *_ = self.model_predictions(img_old_model_noisy, t_input, \
+                        local_cond, global_cond, None, clip_x_start = False)
+                noise_pred_gt_img, _, *_ = self.model_predictions(img_gt_noisy, t_input, \
+                        local_cond, global_cond, None, clip_x_start = False)
+            else:
+                # Predict the noise residual and compute loss based on old model directly
+                noise_pred_old_model = self.model(img_old_model_noisy, t_input, local_cond, global_cond)
+                x_start = self.predict_start_from_noise(img_old_model_noisy, t_input, noise_pred_old_model)
+                
+          
+            if self.is_ddim_sampling is True and t_input[0] > 0:
+                
+                # _, _, log_prob = self.ddim_sample_step(\
+                #     self.ddim_sampling_eta, 
+                #     t_input[0], t_input[0]-1, 
+                #     x_start, noise_pred_old_model, 
+                #     img_prev=img_next_i)
+                """
+                The function has no torch_grad support. So, I replicate its codes here
+                to enable the torch_grad support
+                """
+                alpha = self.alphas_cumprod[t_input[0]]
+                alpha_next = self.alphas_cumprod[t_input[0]-1]
+
+                sigma = self.ddim_sampling_eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
+                c = (1 - alpha_next - sigma ** 2).sqrt()
+
+                
+                # Predict the mean of the previous sample
+                img_prev_mean = x_start * alpha_next.sqrt() + c * noise_pred_old_model
+ 
+                # Understand the mathematics & finalize the function to return the list of log_prob as well
+                log_prob = (
+                    -((img_next_i - img_prev_mean) ** 2) / (2 * (sigma**2))
+                    - math.log(sigma)
+                    - math.log(math.sqrt(2 * math.pi))
+                )
+                # Mean over each individual "pixel" (assume indpendence between "pixels")
+                log_prob = torch.mean(log_prob, axis=tuple(range(1, log_prob.ndim)))
+            else:
+                # _, _, log_prob = self.p_sample(\
+                #     img_old_model_noisy, 
+                #     t_input, 
+                #     local_cond, global_cond, 
+                #     x_self_cond=None, 
+                #     clip_denoised=False, 
+                #     img_prev=img_next_i)
+                """
+                Move the block of code out of a no_grad function
+                """
+                x = img_old_model_noisy
+                b, *_, device = *x.shape, x.device
+                batched_times = torch.full((b,), t, device = x.device, dtype = torch.long)
+                model_mean, _, model_log_variance, x_start = self.p_mean_variance(\
+                    x = x, t = batched_times, \
+                    local_cond = local_cond, global_cond = global_cond,\
+                    x_self_cond = None, clip_denoised = False)
+                noise = torch.randn_like(x) if t > 0 else 0. # no noise if t == 0
+                sigma = (0.5 * model_log_variance).exp()
+                
+                
+                # Calculate the log probabilities
+                log_prob = (
+                    -((img_next_i - model_mean) ** 2) /  (2 * (sigma**2))
+                    - math.log(sigma)
+                    - math.log(math.sqrt(2 * math.pi))
+                )
+                # Mean over each individual "pixel" (assume indpendence between "pixels")
+                log_prob = torch.mean(log_prob, axis=tuple(range(1, log_prob.ndim)))
+
+    
+            ratio_ddpo = torch.exp(log_prob - log_probs_lst[:, i])
+
+
+            # Compute PPOClip loss
+            unclipped_loss_ddpo = -advantages * ratio_ddpo
+            clipped_loss_ddpo = -advantages * torch.clamp(ratio_ddpo, 1.0 - self.clip_range, 1.0 + self.clip_range)
+            loss_ddpo = torch.sum(torch.max(unclipped_loss_ddpo, clipped_loss_ddpo))
+
+            if self.combine_DDPO_MSE:
+                loss = F.mse_loss(noise_pred_gt_img, target, reduction = 'none')
+                loss = reduce(loss, 'b ... -> b', 'mean')
+
+                loss = loss * extract(self.loss_weight, t, loss.shape)
+                loss_mse_reconstruction = loss.mean()
+
+                total_loss += loss_mse_reconstruction * self.mse_loss_coef + loss_ddpo
+            else:
+                total_loss += loss_ddpo
+        
+        return total_loss
+    
+    def forward_ppod_loss(self, local_cond = None, global_cond = None, *args, **kwargs):
+
+        # Extract out the necessary parameters
+        img_w_lst = kwargs["img_w_lst"] # Shape: (B, ts, D, T)
+        img_l_lst = kwargs["img_l_lst"] # Shape: (B, ts, D, T)
+        img_next_w_lst = kwargs["img_next_w_lst"] # Shape: (B, ts, D, T)
+        img_next_l_lst = kwargs["img_next_l_lst"] # Shape: (B, ts, D, T)
+        ts_lst = kwargs["ts_lst"] # Shape: (B, ts)
+        log_probs_w_lst = kwargs["log_probs_w_lst"] # Shape: (B, ts)
+        log_probs_l_lst = kwargs["log_probs_l_lst"] # Shape: (B, ts)
+        
+        logger = kwargs["logger"]
+        
+        train_steps = 70
+        total_loss = 0
+        # for i in random.sample(range(img_next_w_lst.shape[1]), k=train_steps):  # img_lst.shape: torch.Size([6, 10, 4, 64, 64])
+        for i in range(img_next_w_lst.shape[1]):
+            img_w_i, img_next_w_i, t_i = img_w_lst[:, i], img_next_w_lst[:, i], ts_lst[:, i]
+            img_l_i, img_next_l_i = img_l_lst[:, i], img_next_l_lst[:, i]
+            # Normalize the inputs
+            img_w_i = self.normalize(img_w_i)
+            img_next_w_i = self.normalize(img_next_w_i)
+            img_l_i = self.normalize(img_l_i)
+            img_next_l_i = self.normalize(img_next_l_i)
+
+            # Prepare the inputs (TODO: classifier-free guidance?)
+            img_ref_w_noisy = img_w_i
+            img_ref_l_noisy = img_l_i
+            t_input = t_i
+            
+
+            # Predict the probailities of generating the samples from referece model for the new model
+            noise_pred_ref_w = self.model(img_ref_w_noisy, t_input, local_cond, global_cond)
+            x_start_ref_w = self.predict_start_from_noise(img_ref_w_noisy, t_input, noise_pred_ref_w)
+            noise_pred_ref_l = self.model(img_ref_l_noisy, t_input, local_cond, global_cond)
+            x_start_ref_l = self.predict_start_from_noise(img_ref_l_noisy, t_input, noise_pred_ref_l)
+
+            if self.is_ddim_sampling is True and t_input[0] > 0:
+                
+                # _, _, log_prob = self.ddim_sample_step(\
+                #     self.ddim_sampling_eta, 
+                #     t_input[0], t_input[0]-1, 
+                #     x_start, noise_pred_old_model, 
+                #     img_prev=img_next_i)
+                """
+                The function has no torch_grad support. So, I replicate its codes here
+                to enable the torch_grad support
+                """
+                alpha = self.alphas_cumprod[t_input[0]]
+                alpha_next = self.alphas_cumprod[t_input[0]-1]
+
+                sigma = self.ddim_sampling_eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
+                c = (1 - alpha_next - sigma ** 2).sqrt()
+
+                
+                # Predict the mean of the previous sample
+                img_prev_mean_w = x_start_ref_w * alpha_next.sqrt() + c * noise_pred_ref_w
+                img_prev_mean_l = x_start_ref_l * alpha_next.sqrt() + c * noise_pred_ref_l
+
+                # Understand the mathematics & finalize the function to return the list of log_prob as well
+                log_prob_w = (
+                    -((img_next_w_i - img_prev_mean_w) ** 2) / (2 * (sigma**2))
+                    - math.log(sigma)
+                    - math.log(math.sqrt(2 * math.pi))
+                )
+                # Mean over each individual "pixel" (assume indpendence between "pixels")
+                log_prob_w = torch.mean(log_prob_w, axis=tuple(range(1, log_prob_w.ndim)))
+                
+                # Repeat the for the "lose" sample
+                log_prob_l = (
+                    -((img_next_l_i - img_prev_mean_l) ** 2) / (2 * (sigma**2))
+                    - math.log(sigma)
+                    - math.log(math.sqrt(2 * math.pi))
+                )
+                # Mean over each individual "pixel" (assume indpendence between "pixels")
+                log_prob_l = torch.mean(log_prob_l, axis=tuple(range(1, log_prob_l.ndim)))
+            else:
+                print("PPO-D only supports DDIM sampling currently.")
+                raise NotImplementedError("PPO-D only supports DDIM sampling currently.")
+
+            ratio_ddpo_w = log_prob_w - log_probs_w_lst[:, i]
+            ratio_ddpo_l = log_prob_l - log_probs_l_lst[:, i]
+            eta = 0.5
+            ratio_ddpo = eta * torch.clip(ratio_ddpo_w, min = -10, max = 10) - torch.clip(ratio_ddpo_l, min = -10, max = 10)
+
+            # Compute PPOD loss
+            loss_ddpo = ratio_ddpo
+
+            
+            total_loss += loss_ddpo
+
+        return -torch.log(torch.sigmoid(total_loss))
+
+class SimpleMLP(nn.Module):
+    def __init__(self, input_size, hidden_size: int | list, output_size):
+        super(SimpleMLP, self).__init__()
+        self.model = nn.ModuleList([])
+        if isinstance(hidden_size, list):
+            self.model.append(nn.Linear(input_size, hidden_size[0]))
+            self.model.append(nn.ReLU())
+            if len(hidden_size) > 2:
+                for i in range(1, len(hidden_size)):
+                    self.model.append(nn.Linear(hidden_size[i-1], hidden_size[i]))
+                    self.model.append(nn.ReLU())
+            self.model.append(nn.Linear(hidden_size[-1], output_size))
+    def forward(self, x):
+        for layer in self.model:
+            x = layer(x)
+        return x
+class RewardModel(nn.Module):
+    # The function to give the rewarding on the given observation
+    def __init__(self, scale=0.4, state_dim = 4, **kwargs):
+        super().__init__()
+        self.scale = scale
+        
+        
+        device = kwargs["device"]
+        self.device = device
+        
+        # 3. Instantiate Model, Loss Function, and Optimizer
+        self.model = SimpleMLP(state_dim, [32, 32], 1).to(device)
+        self.criterion = nn.MSELoss()  # Mean Squared Error for regression
+        self.optimizer = Adam(self.model.parameters(), lr=0.001)
+
+        # 4. Training Loop
+        self.num_epochs = 500
+        # Record the normalization statistics for action
+        v_max = kwargs["v_max"]
+        angular_v_max = kwargs["angular_v_max"]
+        v_min = kwargs["v_min"]
+        angular_v_min = kwargs["angular_v_min"]
+
+        self.action_upper = torch.tensor([v_max, v_max, angular_v_max]).to(device)
+        self.action_lower = torch.tensor([v_min, v_min, angular_v_min]).to(device)
+    
+    def load_dataset(self, **kwargs):
+        """
+        The object's own function to train the models
+        """
+        # Extract out the states & rewards
+        states = kwargs["states"].to(self.device)
+        actions = kwargs["actions"].to(self.device)
+        rewards = kwargs["rewards"].to(self.device)
+        self.state_dim = states.shape[-1]  # x, y, theta
+        X = torch.hstack((states, actions))
+        y = rewards
+        # Create a TensorDataset and DataLoader
+        self.dataset = TensorDataset(X, y)
+        self.dataloader = DataLoader(self.dataset, batch_size=16, shuffle=True)
+        
+    def train(self):
+        for epoch in range(self.num_epochs):
+            for batch_X, batch_y in self.dataloader:
+                # Forward pass
+                outputs = self.model(batch_X)
+                loss = self.criterion(outputs.squeeze(-1), batch_y)
+
+                # Backward and optimize
+                self.optimizer.zero_grad()  # Clear previous gradients
+                loss.backward()        # Compute gradients
+                self.optimizer.step()       # Update model parameters
+    def save_model(self, path = "./results/rewarding_model.pth"):
+        torch.save(self.model.state_dict(), path)
+    def load_model(self, path = "./results/rewarding_model.pth"):
+        self.model.load_state_dict(torch.load(path, weights_only=False))
+        
+    def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        
+        # action shape: (B, D, T)
+        # state_shape: (B, state_dim)
+        # Extract x, y, theta from the global_cond
+        action = action.mean(dim=-1).to(self.device)  # (B, D)
+        action = action * (self.action_upper - self.action_lower) + self.action_lower
+        rewards = self.model(torch.hstack((state, action)))
+        return rewards
+    
+class NaiveCriticModel(nn.Module):
+    # The function to give the rewarding on the given observation
+    def __init__(self, scale=0.4, **kwargs):
+        super().__init__()
+        self.scale = scale
+        self.state_dim = 3  # x, y, theta
+        
+        v_max = kwargs["v_max"]
+        angular_v_max = kwargs["angular_v_max"]
+        v_min = kwargs["v_min"]
+        angular_v_min = kwargs["angular_v_min"]
+        device = kwargs["device"]
+        self.action_upper = torch.tensor([v_max, v_max, angular_v_max]).to(device)
+        self.action_lower = torch.tensor([v_min, v_min, angular_v_min]).to(device)
+        self.device = kwargs["device"]
+
+
+    def forward(self,state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        # Calculate the reward directly at x^2 + y^2 + 0.4*theta^2
+        # action shape: (B, D, T)
+        # state_shape: (B, state_dim)
+        # Extract x, y, theta from the global_cond
+        
+        x = state[:, -3]
+        y = state[:, -2]
+        theta = state[:, -1]
+        state_values = torch.sqrt(x**2 + y**2) + self.scale * torch.norm(theta)  # (B, )
+        # At first, decode the action into their real-values
+        action = action.mean(dim=-1).to(self.device)  # (B, D)
+        action = action * (self.action_upper - self.action_lower) + self.action_lower
+
+        # Analytical formula to estimate the reward
+        x = x + action[:, 0]
+        y = y + action[:, 1]
+        theta = theta + action[:, 2]
+        rewards = torch.sqrt(x**2 + y**2) + self.scale * torch.norm(theta)  # (B, )
+        rewards = -(rewards - state_values)
+        rewards = rewards.unsqueeze(-1)  # (B, 1)
+        # NOTE: Encourage larger rewards
+        rewards = 1000 * rewards
+        return rewards
+    
 # trainer class
-# TODO: modify the trainer class so as to support conditional training
-class Trainer1DCond(object):
+class Trainer1DCondRL(object):
     def __init__(
         self,
-        diffusion_model: GaussianDiffusion1DConditional,
+        # Diffusion model
+        diffusion_model_baseline: GaussianDiffusion1DConditionalRL,
+        diffusion_model: GaussianDiffusion1DConditionalRL,
+        
+        # Dataset
         dataset: Dataset,
         *,
+        # ppo_dataset = None,
+        # Training hyperparameters
         train_batch_size = 16,
         gradient_accumulate_every = 1,
         train_lr = 1e-4,
         train_num_steps = 100000,
+        PPO_train_num_steps = 100000,
+        
+        # EMA updates
         ema_update_every = 10,
         ema_decay = 0.995,
         adam_betas = (0.9, 0.99),
@@ -1239,7 +1729,13 @@ class Trainer1DCond(object):
         amp = False,
         mixed_precision_type = 'fp16',
         split_batches = True,
-        max_grad_norm = 1.
+        max_grad_norm = 1.,
+        
+        # RL rewarding model
+        rewarding_model = None,
+        
+        # Wandb logger
+        wandb_logger = None
     ):
         super().__init__()
 
@@ -1252,32 +1748,42 @@ class Trainer1DCond(object):
 
         # model
 
+        self.model_baseline = diffusion_model_baseline
         self.model = diffusion_model
         self.channels = diffusion_model.channels
+        
 
         # sampling and training hyperparameters
 
         assert has_int_squareroot(num_samples), 'number of samples must have an integer square root'
         self.num_samples = num_samples
         self.save_and_sample_every = save_and_sample_every
+        self.reward_sample_ppo_every = 10  # after how many PPO steps to resample rewards
 
         self.batch_size = train_batch_size
         self.gradient_accumulate_every = gradient_accumulate_every
         self.max_grad_norm = max_grad_norm
 
         self.train_num_steps = train_num_steps
+        self.PPO_train_num_steps = PPO_train_num_steps
 
         # dataset and dataloader
 
         dl = DataLoader(dataset, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = cpu_count())
-
+        self.batch_size = train_batch_size
         dl = self.accelerator.prepare(dl)
         self.dl = cycle(dl)
 
+        # ppo_dataset = ppo_dataset
+        ppo_dl = DataLoader(dataset, batch_size = 1, shuffle = True, pin_memory = True, num_workers = cpu_count())
+        ppo_dl = self.accelerator.prepare(ppo_dl)
+        self.ppo_dl = cycle(ppo_dl)
         # optimizer
 
         self.opt = Adam(diffusion_model.parameters(), lr = train_lr, betas = adam_betas)
-
+        
+        # PPO is only used for finetuning
+        self.opt_ppo = Adam(diffusion_model.parameters(), lr = 0.1 * train_lr,  betas = adam_betas)
         # for logging results in a folder periodically
 
         if self.accelerator.is_main_process:
@@ -1290,11 +1796,19 @@ class Trainer1DCond(object):
         # step counter state
 
         self.step = 0
+        self.PPO_step = 0
 
         # prepare model, dataloader, optimizer with accelerator
 
-        self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
+        self.model_baseline, self.model, self.opt, self.opt_ppo= \
+            self.accelerator.prepare(self.model_baseline, self.model, self.opt, self.opt_ppo)
 
+        # RL rewarding finetuning
+        self.rewarding_model = rewarding_model
+        
+        # Wandb logger
+        self.wandb_logger = wandb_logger
+        
     @property
     def device(self):
         return self.accelerator.device
@@ -1308,6 +1822,7 @@ class Trainer1DCond(object):
             'model': self.accelerator.get_state_dict(self.model),
             'opt': self.opt.state_dict(),
             'ema': self.ema.state_dict(),
+            'opt_ppo': self.opt_ppo.state_dict(),
             'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None,
             'version': __version__
         }
@@ -1320,10 +1835,13 @@ class Trainer1DCond(object):
 
         data = torch.load(str(self.results_folder / f'model-{milestone}.pt'), map_location=device, weights_only=True)
 
+        model_baseline = self.accelerator.unwrap_model(self.model_baseline)
+        model_baseline.load_state_dict(data['model'])
+        
         model = self.accelerator.unwrap_model(self.model)
         model.load_state_dict(data['model'])
 
-        self.step = data['step']
+        self.step = 0 #data['step']
         self.opt.load_state_dict(data['opt'])
         if self.accelerator.is_main_process:
             self.ema.load_state_dict(data["ema"])
@@ -1333,8 +1851,13 @@ class Trainer1DCond(object):
 
         if exists(self.accelerator.scaler) and exists(data['scaler']):
             self.accelerator.scaler.load_state_dict(data['scaler'])
-
+    
+    
     def train(self):
+        """
+        The function to train the baseline diffusion model following traditional 
+        noise reconstruction loss
+        """
         accelerator = self.accelerator
         device = accelerator.device
 
@@ -1361,7 +1884,7 @@ class Trainer1DCond(object):
 
                     self.accelerator.backward(loss)
 
-                pbar.set_description(f'loss: {total_loss:.4f}')
+                pbar.set_description(f'MSE loss for Noise Estimation: {total_loss:.4f}')
 
                 accelerator.wait_for_everyone()
                 accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
@@ -1391,3 +1914,245 @@ class Trainer1DCond(object):
                 pbar.update(1)
 
         accelerator.print('training complete')
+    
+    def finetune_PPO(self):
+        """
+        Finetune the diffusion model use PPO
+        """
+        # Freeze the baseline diffusion model
+        self.model_baseline.requires_grad_(False)
+        accelerator = self.accelerator
+        device = accelerator.device
+
+        """
+        The crazy idea: test only one data sample!
+        If it still failed, then probably PPO loss is not calculated correctly?
+        """
+        # data = next(self.ppo_dl)
+        # data, local_cond, global_cond = data
+        # data = data.to(device)
+        with tqdm(initial = self.PPO_step, total = self.PPO_train_num_steps, disable = not accelerator.is_main_process) as pbar:
+            while self.PPO_step < self.PPO_train_num_steps:
+                self.model_baseline.eval()
+                self.model.train()
+
+                total_loss = 0.
+                for _ in range(self.gradient_accumulate_every):
+                    data = next(self.dl)
+                    data, local_cond, global_cond = data
+                    data = data.to(device)
+
+                    # Stack the global_cond
+                    with self.accelerator.autocast():
+                        with torch.no_grad():
+                            # Stack the global_cond (from batch_size x state_dim into batch_size * sample_batch_size x state dim)
+                            batch_size_sample = 32
+                            local_cond_sample = torch.repeat_interleave(local_cond, repeats=batch_size_sample, dim=0) # For the local_cond, only to stack them
+                            global_cond_sample = torch.repeat_interleave(global_cond, repeats=batch_size_sample, dim=0)
+                            data_sample = torch.repeat_interleave(data, repeats=batch_size_sample, dim=0)
+                            # Sample a batch of data using the baseline policy
+                            img, img_lst, img_next_lst, ts_lst, log_probs_lst = \
+                                self.model_baseline.sample_verbose(global_cond.shape[0] * batch_size_sample, local_cond_sample, global_cond_sample)
+                            reward_scores = self.rewarding_model(global_cond_sample, img)
+                            
+                            # Size of reward_scores: (bs, 1) => (bs, )
+                            reward_scores = torch.Tensor(reward_scores).squeeze(-1).to(self.accelerator.device)
+                            # avg_reward_step = all_rewards_valid.mean().item() /self.gradient_accumulate_every
+                            
+                            # (batch_size*batch_size_sample, ) => (batch_size, batch_size_sample, )
+                            reward_scores = reward_scores.view(global_cond.shape[0], batch_size_sample)
+                            
+                            all_rewards = self.accelerator.gather(reward_scores)
+                            # add a small offset 1e-7 to avoid denominator being 0
+                            advantages = (reward_scores - torch.mean(all_rewards, dim=1, keepdim=True)) / (
+                                    torch.std(all_rewards, dim=1, keepdim=True) + 1e-7)
+                            # Convert advantages back to (batch_size*batch_size_sample, )
+                            advantages = advantages.view(-1, 1)
+                           
+                            # Clip the advantages
+                            adv_clip_max = 10.0
+                            advantages = torch.clamp(advantages, -adv_clip_max, adv_clip_max)
+                        # Obtain the DD-PPO loss
+                        loss = self.model.forward_ppo_loss(data_sample, local_cond_sample, global_cond_sample,
+                                          img_lst=img_lst,
+                                          img_next_lst=img_next_lst,
+                                          ts_lst=ts_lst,
+                                          log_probs_lst=log_probs_lst,
+                                          advantages=advantages.squeeze(-1),
+                                          logger = self.wandb_logger)
+                        loss = loss / self.gradient_accumulate_every
+                        total_loss += loss.item()
+                    self.accelerator.backward(loss)
+
+                pbar.set_description(f'PPO loss: {total_loss:.4f}')
+                if self.wandb_logger is not None:
+                    self.wandb_logger.log({"PPO Objective": total_loss})
+                    
+
+                accelerator.wait_for_everyone()
+                accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+
+                self.opt_ppo.step()
+                self.opt_ppo.zero_grad()
+
+                accelerator.wait_for_everyone()
+
+                self.PPO_step += 1
+                if accelerator.is_main_process:
+                    self.ema.update()
+
+                    if self.PPO_step != 0 and self.PPO_step % self.reward_sample_ppo_every == 0 \
+                        and self.wandb_logger is not None:
+                        self.ema.ema_model.eval()
+
+                        with torch.no_grad():
+                            data = next(self.dl)
+                            data, local_cond, global_cond = data
+                            data = data.to(device)
+                            batch_size_sample = 32
+                            local_cond_sample = torch.repeat_interleave(local_cond, repeats=batch_size_sample, dim=0) # For the local_cond, only to stack them
+                            global_cond_sample = torch.repeat_interleave(global_cond, repeats=batch_size_sample, dim=0)
+                            data_sample = torch.repeat_interleave(data, repeats=batch_size_sample, dim=0)
+                            # Sample a batch of data using the latest policy
+                            img_new, img_lst, img_next_lst, ts_lst, log_probs_lst = \
+                                self.model.sample_verbose(global_cond.shape[0] * batch_size_sample, local_cond_sample, global_cond_sample)
+                            reward_scores_new = self.rewarding_model(global_cond_sample, img_new)
+                            
+                            
+                            reward_new = reward_scores_new.mean().item()
+                             # Sample a batch of data using the baseline policy
+                            img, img_lst, img_next_lst, ts_lst, log_probs_lst = \
+                                self.model_baseline.sample_verbose(global_cond.shape[0] * batch_size_sample, local_cond_sample, global_cond_sample)
+                            reward_scores = self.rewarding_model(global_cond_sample, img)
+                            self.wandb_logger.log({"PPO Sampled Reward (Mean, baseline - new)": reward_scores.mean().item() - reward_new})
+                            self.wandb_logger.log({"PPO Sampled Reward (baseline)": reward_scores.mean().item()})
+                            self.wandb_logger.log({"PPO Sampled Reward (new)": reward_new})
+                           
+                            self.wandb_logger.log({"PPO Sampled Reward (Std, new)": reward_scores_new.std().item()})
+
+                pbar.update(1)
+
+        accelerator.print('PPO training complete')
+        self.PPO_step = 0
+        
+    def finetune_PPOD(self):
+        """
+        Finetune the diffusion model use PPO
+        """
+        # Freeze the baseline diffusion model
+        self.model_baseline.requires_grad_(False)
+        accelerator = self.accelerator
+        device = accelerator.device
+
+        with tqdm(initial = self.PPO_step, total = self.PPO_train_num_steps, disable = not accelerator.is_main_process) as pbar:
+            while self.PPO_step < self.PPO_train_num_steps:
+                self.model_baseline.eval()
+                self.model.train()
+
+                total_loss = 0.
+                for _ in range(self.gradient_accumulate_every):
+                    data = next(self.dl)
+                    data, local_cond, global_cond = data
+                    data = data.to(device)
+                    
+                    # Stack the global_cond
+                    with self.accelerator.autocast():
+                        with torch.no_grad():
+                            # Stack the global_cond (from batch_size x state_dim into batch_size * sample_batch_size x state dim)
+                            batch_size_sample = 32
+                            local_cond_sample = torch.repeat_interleave(local_cond, repeats=batch_size_sample, dim=0) # For the local_cond, only to stack them
+                            global_cond_sample = torch.repeat_interleave(global_cond, repeats=batch_size_sample, dim=0)
+                            data = torch.repeat_interleave(data, repeats=batch_size_sample, dim=0)
+                            # Sample a batch of data using the baseline policy
+                            img, img_lst, img_next_lst, ts_lst, log_probs_lst = \
+                                self.model_baseline.sample_verbose(global_cond.shape[0] * batch_size_sample, local_cond_sample, global_cond_sample)
+                            reward_scores = self.rewarding_model(global_cond_sample, img)
+                            
+                            # Size of reward_scores: (bs, 1) => (bs, )
+                            reward_scores = torch.Tensor(reward_scores).squeeze(-1).to(self.accelerator.device)
+                            # avg_reward_step = all_rewards_valid.mean().item() /self.gradient_accumulate_every
+                            
+                            # (batch_size*batch_size_sample, ) => (batch_size, batch_size_sample, )
+                            reward_scores = reward_scores.view(global_cond.shape[0], batch_size_sample)
+                            
+                            # Find the best reward & the worst reward
+                            best_reward_idx = torch.argmax(reward_scores, dim=1)
+                            worst_reward_idx = torch.argmin(reward_scores, dim=1)
+
+                            # Reshape the tensors
+                            img_lst = img_lst.view(global_cond.shape[0], batch_size_sample, *img_lst.shape[1:])  # (B, sample_bs, D, T)
+                            img_next_lst = img_next_lst.view(global_cond.shape[0], batch_size_sample, *img_next_lst.shape[1:])  # (B, sample_bs, D, T)
+
+                            ts_lst = ts_lst.view(global_cond.shape[0], batch_size_sample, -1)  # (B, sample_bs, T)
+                            log_probs_lst = log_probs_lst.view(global_cond.shape[0], batch_size_sample, -1)  # (B, sample_bs, T)
+                            ts_lst = ts_lst[:, 0, :]  # Just take the ts from the first sample
+                            
+                            img_lst_w = img_lst[torch.arange(global_cond.shape[0]), best_reward_idx, ...]
+                            img_next_w_lst = img_next_lst[torch.arange(global_cond.shape[0]), best_reward_idx, ...]
+                            log_probs_w_lst = log_probs_lst[torch.arange(global_cond.shape[0]), best_reward_idx]
+                            
+                            # The "bad" or "lose" samples
+                            img_lst_l = img_lst[torch.arange(global_cond.shape[0]), worst_reward_idx, ...]
+                            img_next_l_lst = img_next_lst[torch.arange(global_cond.shape[0]), worst_reward_idx, ...]
+                            log_probs_l_lst = log_probs_lst[torch.arange(global_cond.shape[0]), worst_reward_idx]
+                            
+                        # Obtain the PPOD loss
+                        loss = self.model.forward_ppod_loss(local_cond, global_cond,
+                                          img_w_lst = img_lst_w,
+                                          img_l_lst = img_lst_l,
+                                          img_next_w_lst = img_next_w_lst,
+                                          img_next_l_lst = img_next_l_lst,
+                                          ts_lst = ts_lst,
+                                          log_probs_w_lst = log_probs_w_lst,
+                                          log_probs_l_lst = log_probs_l_lst,
+                                          logger = self.wandb_logger)
+                        loss = loss / self.gradient_accumulate_every
+                        total_loss += loss.mean().item()
+                    self.accelerator.backward(loss.mean())
+
+                pbar.set_description(f'PPOD loss: {total_loss:.4f}')
+                if self.wandb_logger is not None:
+                    self.wandb_logger.log({"PPOD Objective": total_loss})
+                    
+
+                accelerator.wait_for_everyone()
+                accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+
+                self.opt_ppo.step()
+                self.opt_ppo.zero_grad()
+
+                accelerator.wait_for_everyone()
+
+                self.PPO_step += 1
+                if accelerator.is_main_process:
+                    self.ema.update()
+
+                    if self.PPO_step != 0 and self.PPO_step % self.reward_sample_ppo_every == 0 \
+                        and self.wandb_logger is not None:
+                        self.ema.ema_model.eval()
+
+                        with torch.no_grad():
+                            data = next(self.dl)
+                            data, local_cond, global_cond = data
+                            data = data.to(device)
+                            batch_size_sample = 32
+                            local_cond_sample = torch.repeat_interleave(local_cond, repeats=batch_size_sample, dim=0) # For the local_cond, only to stack them
+                            global_cond_sample = torch.repeat_interleave(global_cond, repeats=batch_size_sample, dim=0)
+                            data = torch.repeat_interleave(data, repeats=batch_size_sample, dim=0)
+                            # Sample a batch of data using the latest policy
+                            img_new, img_lst, img_next_lst, ts_lst, log_probs_lst = \
+                                self.model.sample_verbose(global_cond.shape[0] * batch_size_sample, local_cond_sample, global_cond_sample)
+                            reward_scores_new = self.rewarding_model(global_cond_sample, img_new)
+                            
+                            
+                            reward_new = reward_scores_new.mean().item()
+                             # Sample a batch of data using the baseline policy
+                            img, img_lst, img_next_lst, ts_lst, log_probs_lst = \
+                                self.model_baseline.sample_verbose(global_cond.shape[0] * batch_size_sample, local_cond_sample, global_cond_sample)
+                            reward_scores = self.rewarding_model(global_cond_sample, img)
+                            self.wandb_logger.log({"PPOD Sampled Reward (Mean, baseline - new)": reward_scores.mean().item() - reward_new})
+                pbar.update(1)
+
+        accelerator.print('PPOD training complete')
+        self.PPO_step = 0
+

@@ -10,6 +10,9 @@ from denoising_diffusion_pytorch.denoising_diffusion_pytorch_1d import GaussianD
 from denoising_diffusion_pytorch.denoising_diffusion_pytorch_1d_cond \
     import ConditionalUnet1D, GaussianDiffusion1DConditional, \
         Trainer1DCond, Dataset1DCond, TransformerForDiffusion
+from denoising_diffusion_pytorch.denoising_diffusion_pytorch_1d_cond_RL \
+    import GaussianDiffusion1DConditionalRL, \
+        Trainer1DCondRL, RewardModel, NaiveCriticModel
 from denoising_diffusion_pytorch.karras_unet import (
     KarrasUnet,
     InvSqrtDecayLRSched
