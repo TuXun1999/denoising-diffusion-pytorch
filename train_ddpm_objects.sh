@@ -1,4 +1,4 @@
-directories=../trained_models
+directories=../collected_demos
 
 for dir in "$directories"/*; do
     dir=$(basename ${dir})
