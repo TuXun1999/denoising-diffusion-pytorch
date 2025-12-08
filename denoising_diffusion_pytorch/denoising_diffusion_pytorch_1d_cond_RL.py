@@ -6,7 +6,7 @@ from collections import namedtuple
 from typing import Union, Optional, Tuple
 from multiprocessing import cpu_count
 import einops
-
+import numpy as np
 import torch
 from torch import nn, einsum, Tensor
 from torch.nn import Module, ModuleList
@@ -24,7 +24,7 @@ from ema_pytorch import EMA
 from tqdm.auto import tqdm
 
 from denoising_diffusion_pytorch.version import __version__
-
+# from TD3 import TD3_DSRL
 # constants
 
 ModelPrediction =  namedtuple('ModelPrediction', ['pred_noise', 'pred_x_start'])
@@ -71,41 +71,6 @@ def normalize_to_neg_one_to_one(img):
 def unnormalize_to_zero_to_one(t):
     return (t + 1) * 0.5
 
-# data
-
-class Dataset1D(Dataset):
-    def __init__(self, tensor: Tensor):
-        super().__init__()
-        self.tensor = tensor.clone()
-
-    def __len__(self):
-        return len(self.tensor)
-
-    def __getitem__(self, idx):
-        return self.tensor[idx].clone()
-class Dataset1DCond(Dataset):
-    def __init__(self, tensor: Tensor, local_cond: Tensor = None, global_cond: Tensor = None):
-        super().__init__()
-        self.tensor = tensor.clone()
-        self.local_cond = None
-        self.global_cond = None
-        if local_cond is not None:
-            self.local_cond = local_cond.clone()
-        if global_cond is not None:
-            self.global_cond = global_cond.clone()
-
-    def __len__(self):
-        return len(self.tensor)
-
-    def __getitem__(self, idx):
-        a = self.tensor[idx].clone()
-        b = None
-        c = None
-        if self.local_cond is not None:
-            b = self.local_cond[idx].clone()
-        if self.global_cond is not None:
-            c = self.global_cond[idx].clone()
-        return (a, b, c)
 # small helper modules
 
 class Residual(Module):
@@ -903,6 +868,7 @@ class GaussianDiffusion1DConditionalRL(Module):
         model,
         *,
         seq_length,
+        action_length = 8, 
         timesteps = 1000,
         sampling_timesteps = None,
         objective = 'pred_noise',
@@ -918,7 +884,9 @@ class GaussianDiffusion1DConditionalRL(Module):
         self.combine_DDPO_MSE = combine_DDPO_MSE
         self.mse_loss_coef = 0.5 if combine_DDPO_MSE else 0.0
         self.clip_range = 2e-1
+        self.guidance_weight = 0.2
         self.seq_length = seq_length
+        self.action_length = action_length
 
         self.objective = objective
 
@@ -1031,13 +999,24 @@ class GaussianDiffusion1DConditionalRL(Module):
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def model_predictions(self, x, t, local_cond = None, global_cond = None, x_self_cond = None, clip_x_start = False, rederive_pred_noise = False):
-        model_output = self.model(x, t, local_cond, global_cond)
+    def model_predictions(self, x, t, local_cond = None, global_cond = None, \
+            x_self_cond = None, clip_x_start = False, rederive_pred_noise = False,\
+            cfg = False):
+        
         maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
 
+        if cfg is True:
+            local_cond_null = torch.zeros_like(local_cond).to(local_cond.device)
+            model_output_null = self.model(x, t, local_cond_null, global_cond)
+            local_cond_optimality = torch.ones_like(local_cond).to(local_cond.device)
+            model_output = self.model(x, t, local_cond_optimality, global_cond) # Output when optimality=1
+            model_output = self.guidance_weight * (model_output - model_output_null) + model_output_null
+        else:
+            model_output = self.model(x, t, local_cond, global_cond)
         if self.objective == 'pred_noise':
             # TODO: fix up the conversion between start & noise
             pred_noise = model_output
+            # NOTE: cfg++ uses pred_noise = model_output_null here
             x_start = self.predict_start_from_noise(x, t, pred_noise)
             x_start = maybe_clip(x_start)
 
@@ -1062,8 +1041,8 @@ class GaussianDiffusion1DConditionalRL(Module):
 
     # TODO: understand the codes here
     def p_mean_variance(self, x, t, local_cond = None, global_cond = None, \
-                        x_self_cond = None, clip_denoised = True):
-        preds = self.model_predictions(x, t, local_cond, global_cond, x_self_cond)
+                        x_self_cond = None, clip_denoised = True, cfg = False):
+        preds = self.model_predictions(x, t, local_cond, global_cond, x_self_cond, cfg = cfg)
         x_start = preds.pred_x_start
 
         if clip_denoised:
@@ -1075,13 +1054,14 @@ class GaussianDiffusion1DConditionalRL(Module):
     @torch.no_grad()
     def p_sample(self, x, t: int, \
                  local_cond = None, global_cond = None, \
-                    x_self_cond = None, clip_denoised = True, img_prev = None):
+                    x_self_cond = None, clip_denoised = True, \
+                    cfg = False):
         b, *_, device = *x.shape, x.device
         batched_times = torch.full((b,), t, device = x.device, dtype = torch.long)
         model_mean, _, model_log_variance, x_start = self.p_mean_variance(\
             x = x, t = batched_times, \
             local_cond = local_cond, global_cond = global_cond,\
-            x_self_cond = x_self_cond, clip_denoised = clip_denoised)
+            x_self_cond = x_self_cond, clip_denoised = clip_denoised, cfg = cfg)
         noise = torch.randn_like(x) if t > 0 else 0. # no noise if t == 0
         sigma = (0.5 * model_log_variance).exp()
         # TODO: further understand the mathematics here & return log scores as well
@@ -1103,10 +1083,11 @@ class GaussianDiffusion1DConditionalRL(Module):
     as well
     """
     @torch.no_grad()
-    def p_sample_loop(self, shape, local_cond = None, global_cond = None, verbose = False):
+    def p_sample_loop(self, shape, local_cond = None, global_cond = None,\
+        verbose = False, cfg = False, w_init = None):
         batch, device = shape[0], self.betas.device
 
-        img = torch.randn(shape, device=device)
+        img = torch.randn(shape, device=device) if w_init is None else w_init.to(device)
         local_cond = local_cond.to(device)
         global_cond = global_cond.to(device)
         x_start = None
@@ -1120,7 +1101,7 @@ class GaussianDiffusion1DConditionalRL(Module):
             self_cond = x_start if self.self_condition else None
             if verbose is True:
                 img_lst.append(img)
-            img, x_start, log_prob = self.p_sample(img, t, local_cond, global_cond, self_cond)
+            img, x_start, log_prob = self.p_sample(img, t, local_cond, global_cond, self_cond, cfg=cfg)
             
             if verbose is True:
                 img_next_lst.append(img)
@@ -1168,11 +1149,15 @@ class GaussianDiffusion1DConditionalRL(Module):
             img_prev =  img_prev_mean + sigma * noise
 
         # Understand the mathematics & finalize the function to return the list of log_prob as well
-        log_prob = (
-            -((img_prev - img_prev_mean) ** 2) / (2 * (sigma**2))
-            - math.log(sigma)
-            - math.log(math.sqrt(2 * math.pi))
-        )
+        if sigma != 0: # noise in sampling
+            log_prob = (
+                -((img_prev - img_prev_mean) ** 2) / (2 * (sigma**2))
+                - math.log(sigma)
+                - math.log(math.sqrt(2 * math.pi))
+            )
+        else: # deterministic sampling
+            log_prob = torch.zeros_like(img_prev)
+            
         # Mean over each individual "pixel" (assume indpendence between "pixels")
         log_prob = torch.mean(log_prob, axis=tuple(range(1, log_prob.ndim)))
         
@@ -1180,15 +1165,17 @@ class GaussianDiffusion1DConditionalRL(Module):
         return img, x_start, log_prob
     
     @torch.no_grad()
-    def ddim_sample(self, shape, local_cond, global_cond, clip_denoised = True, verbose = False):
+    def ddim_sample(self, shape, local_cond, global_cond, 
+                    clip_denoised = True, verbose = False,\
+                    cfg = False, w_init = None):
         batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.betas.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
 
         times = torch.linspace(-1, total_timesteps - 1, steps=sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
         times = list(reversed(times.int().tolist()))
         time_pairs = list(zip(times[:-1], times[1:])) # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
 
-        # The sample to genereta
-        img = torch.randn(shape, device = device)
+        # The sample to generate
+        img = torch.randn(shape, device = device) if w_init is None else w_init.to(device)
 
         # The predicted initial sample
         x_start = None
@@ -1205,7 +1192,9 @@ class GaussianDiffusion1DConditionalRL(Module):
                 img_lst.append(img)
             self_cond = x_start if self.self_condition else None
             pred_noise, x_start, *_ = self.model_predictions(img, time_cond, \
-                                        local_cond, global_cond, self_cond, clip_x_start = clip_denoised)
+                                        local_cond, global_cond, self_cond, \
+                                        clip_x_start = clip_denoised,\
+                                        cfg = cfg)
 
             if time_next < 0: 
                 # At the final stage, the predicted sample is the inital sample
@@ -1238,10 +1227,10 @@ class GaussianDiffusion1DConditionalRL(Module):
         return img
 
     @torch.no_grad()
-    def sample(self,  batch_size = 16, local_cond = None, global_cond = None):
+    def sample(self,  batch_size = 16, local_cond = None, global_cond = None, w_init = None):
         seq_length, channels = self.seq_length, self.channels
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
-        return sample_fn((batch_size, channels, seq_length), local_cond, global_cond)
+        return sample_fn((batch_size, channels, seq_length), local_cond, global_cond, w_init=w_init)
     
     
     @torch.no_grad()
@@ -1250,6 +1239,11 @@ class GaussianDiffusion1DConditionalRL(Module):
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
         return sample_fn((batch_size, channels, seq_length), local_cond, global_cond, verbose=True)
     
+    @torch.no_grad()
+    def sample_cfg(self, batch_size = 16, local_cond = None, global_cond = None):
+        seq_length, channels = self.seq_length, self.channels
+        sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
+        return sample_fn((batch_size, channels, seq_length), local_cond, global_cond, cfg = True)
     
     @torch.no_grad()
     def interpolate(self, x1, x2, t = None, lam = 0.5):
@@ -1280,12 +1274,12 @@ class GaussianDiffusion1DConditionalRL(Module):
             extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
-    def p_losses(self, x_start, t, local_cond=None, global_cond=None, noise = None):
+    def p_losses(self, x_start, t, local_cond = None, global_cond = None, noise = None):
         b, c, n = x_start.shape
         noise = default(noise, lambda: torch.randn_like(x_start))
 
         # noise sample
-        # NOTE: no need to add conditions here (sample the random timesteps)
+        # NOTE: no need to add conditions here (sample the "image" at the random timestep)
         x = self.q_sample(x_start = x_start, t = t, noise = noise)
 
         # if doing self-conditioning, 50% of the time, predict x_start from current set of times
@@ -1323,7 +1317,19 @@ class GaussianDiffusion1DConditionalRL(Module):
         b, c, n, device, seq_length, = *img.shape, img.device, self.seq_length
         assert n == seq_length, f'seq length must be {seq_length}'
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
-
+        
+        img = self.normalize(img)
+        return self.p_losses(img, t, local_cond, global_cond, *args, **kwargs)
+    
+    def forward_cfg(self, img, local_cond = None, global_cond = None, *args, **kwargs):
+        b, c, n, device, seq_length, = *img.shape, img.device, self.seq_length
+        assert n == seq_length, f'seq length must be {seq_length}'
+        t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
+        
+        # Classifier-free-guidance: randomly dropped the grasp condition
+        random_num = random.random()
+        if random_num < 0.1:
+            local_cond = torch.zeros_like(local_cond).to(local_cond.device)
         img = self.normalize(img)
         return self.p_losses(img, t, local_cond, global_cond, *args, **kwargs)
     
@@ -1357,7 +1363,7 @@ class GaussianDiffusion1DConditionalRL(Module):
             img_i = self.normalize(img_i)
             img_next_i = self.normalize(img_next_i)
 
-            # Prepare the inputs (TODO: classifier-free guidance?)
+            # Prepare the inputs
             img_old_model_noisy = img_i
             t_input = t_i
             if self.combine_DDPO_MSE is True:
@@ -1365,7 +1371,7 @@ class GaussianDiffusion1DConditionalRL(Module):
                 img_gt = img
 
                 # Generate noisy samples from the ground-truth image
-                noise = default(noise, lambda: torch.randn_like(img_gt))
+                noise = torch.randn_like(img_gt)
 
                 # noise sample
                 # NOTE: no need to add conditions here
@@ -1675,7 +1681,7 @@ class NaiveCriticModel(nn.Module):
         self.device = kwargs["device"]
 
 
-    def forward(self,state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+    def forward(self,state: torch.Tensor, action: torch.Tensor = None) -> torch.Tensor:
         # Calculate the reward directly at x^2 + y^2 + 0.4*theta^2
         # action shape: (B, D, T)
         # state_shape: (B, state_dim)
@@ -1684,20 +1690,39 @@ class NaiveCriticModel(nn.Module):
         x = state[:, -3]
         y = state[:, -2]
         theta = state[:, -1]
-        state_values = torch.sqrt(x**2 + y**2) + self.scale * torch.norm(theta)  # (B, )
+        
+        xy_dist = torch.sqrt(x**2 + y**2)
+        theta_dist = torch.norm(theta)
         # At first, decode the action into their real-values
-        action = action.mean(dim=-1).to(self.device)  # (B, D)
-        action = action * (self.action_upper - self.action_lower) + self.action_lower
+        if action is not None:
+            # The normalization has already ensured that the action angle is in [-pi, pi]
+            action = action * (self.action_upper.unsqueeze(-1) - self.action_lower.unsqueeze(-1)) + self.action_lower.unsqueeze(-1)
+            action = action.sum(dim=-1).to(self.device)  # (B, D)
+        else:
+            # For a None input, assume that it's doing nothing
+            action = torch.zeros_like(self.action_lower).unsqueeze(0).to(self.device)
+            action = torch.repeat_interleave(action, repeats=state.shape[0], dim=0)
 
         # Analytical formula to estimate the reward
         x = x + action[:, 0]
         y = y + action[:, 1]
         theta = theta + action[:, 2]
-        rewards = torch.sqrt(x**2 + y**2) + self.scale * torch.norm(theta)  # (B, )
-        rewards = -(rewards - state_values)
+        
+        x_norm = x / xy_dist
+        y_norm = y / xy_dist
+        theta_norm = theta / (theta_dist + 1e-6)
+        
+        # No need to normalize theta there
+        # because if theta is large in quantity, it should be penalized more
+        
+
+        rewards = torch.sqrt(x_norm**2 + y_norm**2) + self.scale * torch.norm(theta_norm)  # (B, )
+
+        rewards = -rewards #-torch.exp(rewards) + 1 # The smaller the distance, the larger the reward
         rewards = rewards.unsqueeze(-1)  # (B, 1)
         # NOTE: Encourage larger rewards
-        rewards = 1000 * rewards
+        rewards = 10 * torch.clamp(rewards, min = -5, max = 5)
+        
         return rewards
     
 # trainer class
@@ -1915,6 +1940,113 @@ class Trainer1DCondRL(object):
 
         accelerator.print('training complete')
     
+    def train_cfg(self):
+        """
+        The function to train the baseline diffusion model following traditional 
+        noise reconstruction loss & classifier-free guidance
+        """
+        accelerator = self.accelerator
+        device = accelerator.device
+
+        with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
+
+            while self.step < self.train_num_steps:
+                self.model.train()
+
+                total_loss = 0.
+
+                for _ in range(self.gradient_accumulate_every):
+                    data = next(self.dl)
+                    
+                    # Different from traditional method, local_cond here 
+                    # also describes the optimality of the state-action pair
+                    data, local_cond, global_cond = data
+                    data = data.to(device)
+                    if local_cond is not None:
+                        local_cond = local_cond.to(device)
+                    if global_cond is not None:
+                        global_cond = global_cond.to(device)
+                    
+                    with self.accelerator.autocast():
+                        loss = self.model.forward_cfg(data, local_cond, global_cond)
+                        loss = loss / self.gradient_accumulate_every
+                        total_loss += loss.item()
+
+                    self.accelerator.backward(loss)
+
+                pbar.set_description(f'MSE loss for Noise Estimation: {total_loss:.4f}')
+
+                accelerator.wait_for_everyone()
+                accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+
+                self.opt.step()
+                self.opt.zero_grad()
+
+                accelerator.wait_for_everyone()
+
+                self.step += 1
+                if accelerator.is_main_process:
+                    self.ema.update()
+
+                    if self.step != 0 and self.step % self.save_and_sample_every == 0:
+                        self.ema.ema_model.eval()
+
+                        with torch.no_grad():
+                            milestone = self.step // self.save_and_sample_every
+                            batches = num_to_groups(self.num_samples, self.batch_size)
+                            all_samples_list = list(map(lambda n: self.ema.ema_model.sample(batch_size=n, local_cond=local_cond, global_cond=global_cond), batches))
+
+                        all_samples = torch.cat(all_samples_list, dim = 0)
+
+                        torch.save(all_samples, str(self.results_folder / f'sample-{milestone}.png'))
+                        self.save(milestone)
+
+                pbar.update(1)
+
+        accelerator.print('training complete')
+    
+    
+    def train_dsrl(self):
+        """
+        The function to train a separate TD3 agent for the initial noise sampling
+        following the idea in DSRL paper: https://arxiv.org/pdf/2506.15799
+        """
+        accelerator = self.accelerator
+        device = accelerator.device
+        
+        # Obtain the dimension of state and action from the data
+        data = next(self.dl)
+        data, local_cond, global_cond = data
+        data = data.to(device)
+        if local_cond is not None: # local_cond here is zero (for optimality)
+            local_cond = local_cond.to(device)
+        if global_cond is not None:
+            global_cond = global_cond.to(device)
+        state_dim = global_cond.shape[-1]
+        action_dim = data.shape[1] * data.shape[2]  # D * T
+        self.td3_agent = TD3_DSRL(state_dim, action_dim, max_action=0.5, device=device)
+        print("Initialized TD3 agent for DSRL training. => check wandb for details")
+
+        while self.step < self.train_num_steps:
+            data = next(self.dl)
+            
+            # Different from traditional method, local_cond here 
+            # also describes the optimality of the state-action pair
+            data, local_cond, global_cond = data
+            data = data.to(device)
+            if local_cond is not None:
+                local_cond = local_cond.to(device)
+            if global_cond is not None:
+                global_cond = global_cond.to(device)
+            state = global_cond.clone()
+            noise_latent = torch.randn_like(data).to(device) # Flatten the noise latent for TD3 agent
+            action = self.model.sample(global_cond.shape[0], local_cond, global_cond, w_init = noise_latent)
+            reward = self.rewarding_model(state, action) # Obtain the reward from the rewarding model
+            self.td3_agent.train(state, noise_latent.flatten(start_dim=1), reward, wandb_logger=self.wandb_logger)
+                    
+                
+        print('training complete')
+    
     def finetune_PPO(self):
         """
         Finetune the diffusion model use PPO
@@ -1950,15 +2082,19 @@ class Trainer1DCondRL(object):
                             local_cond_sample = torch.repeat_interleave(local_cond, repeats=batch_size_sample, dim=0) # For the local_cond, only to stack them
                             global_cond_sample = torch.repeat_interleave(global_cond, repeats=batch_size_sample, dim=0)
                             data_sample = torch.repeat_interleave(data, repeats=batch_size_sample, dim=0)
-                            # Sample a batch of data using the baseline policy
+                            # Sample a batch of data using the baseline policy (img => generated action)
                             img, img_lst, img_next_lst, ts_lst, log_probs_lst = \
                                 self.model_baseline.sample_verbose(global_cond.shape[0] * batch_size_sample, local_cond_sample, global_cond_sample)
-                            reward_scores = self.rewarding_model(global_cond_sample, img)
-                            
+                            action_length = self.model.action_length
+                            reward_scores = self.rewarding_model(global_cond_sample, img[:, :, :action_length])
+                            # print("Reward scores std: ", reward_scores.std().item())
+                            # print("Reward scores mean: ", reward_scores.mean().item())
+                            # exit(0)
                             # Size of reward_scores: (bs, 1) => (bs, )
                             reward_scores = torch.Tensor(reward_scores).squeeze(-1).to(self.accelerator.device)
                             # avg_reward_step = all_rewards_valid.mean().item() /self.gradient_accumulate_every
                             
+                            # Estimate advantages by averaging
                             # (batch_size*batch_size_sample, ) => (batch_size, batch_size_sample, )
                             reward_scores = reward_scores.view(global_cond.shape[0], batch_size_sample)
                             
@@ -1968,6 +2104,7 @@ class Trainer1DCondRL(object):
                                     torch.std(all_rewards, dim=1, keepdim=True) + 1e-7)
                             # Convert advantages back to (batch_size*batch_size_sample, )
                             advantages = advantages.view(-1, 1)
+                            
                            
                             # Clip the advantages
                             adv_clip_max = 10.0
@@ -2025,11 +2162,20 @@ class Trainer1DCondRL(object):
                                 self.model_baseline.sample_verbose(global_cond.shape[0] * batch_size_sample, local_cond_sample, global_cond_sample)
                             reward_scores = self.rewarding_model(global_cond_sample, img)
                             self.wandb_logger.log({"PPO Sampled Reward (Mean, baseline - new)": reward_scores.mean().item() - reward_new})
-                            self.wandb_logger.log({"PPO Sampled Reward (baseline)": reward_scores.mean().item()})
-                            self.wandb_logger.log({"PPO Sampled Reward (new)": reward_new})
-                           
+                            self.wandb_logger.log({"PPO Sampled Reward (baseline)": reward_scores.mean().item() + 0.1 * np.exp(1.4)}) # Offset for advantage
+                            self.wandb_logger.log({"PPO Sampled Reward (new)": reward_new + 0.1 * np.exp(1.4)}) # Offset for advantage
                             self.wandb_logger.log({"PPO Sampled Reward (Std, new)": reward_scores_new.std().item()})
-
+                            self.wandb_logger.log({"PPO Sampled Reward (Std, baseline)": reward_scores.std().item()})
+                            # Update the baseline model to the new model
+                            # model_baseline = self.accelerator.unwrap_model(self.model_baseline)
+                            # model = self.accelerator.unwrap_model(self.model)
+                            # model_baseline.load_state_dict(model.state_dict())
+                    # baseline_update_every = 50 * self.reward_sample_ppo_every
+                    # if self.PPO_step !=0 and self.PPO_step % baseline_update_every == 0:
+                    #     # Update the baseline model to the new model
+                    #     model_baseline = self.accelerator.unwrap_model(self.model_baseline)
+                    #     model = self.accelerator.unwrap_model(self.model)
+                    #     model_baseline.load_state_dict(model.state_dict())    
                 pbar.update(1)
 
         accelerator.print('PPO training complete')
