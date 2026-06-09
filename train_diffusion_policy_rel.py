@@ -99,14 +99,15 @@ def create_dataset(args):
     ## Step 2: Build up the training samples
     for i in range(len(gripper_poses)):
         # Select samples with a gap between them => ensure a sufficient displacement
-        gripper_poses_one_demo = gripper_poses[i] # time_steps x 3
-        object_poses_one_demo = object_poses[i] # time_steps x 3
+        gripper_poses_one_demo = gripper_poses[i][::2] # time_steps x 3
+        object_poses_one_demo = object_poses[i][::2] # time_steps x 3
         poses_one_demo = np.hstack((gripper_poses_one_demo, object_poses_one_demo)) # time_steps x 6
 
         # _, poses_unique_idx = np.unique(poses_one_demo, axis=0, return_index=True) # Remove the duplicate elements
         # poses_one_demo = poses_one_demo[poses_unique_idx]
         demo_length = poses_one_demo.shape[0]
-        
+        object_pose_init = object_poses_one_demo[0]
+        object_pose_init = np.stack((object_pose_init, ) * obs_length, axis=0).flatten()
         for j in range(obs_length-1, demo_length-pred_length-1):
         # for j in range(obs_length - 1, demo_length - 2):
             # Extract out the observations
@@ -132,7 +133,7 @@ def create_dataset(args):
             Current approach: Look at object pose
             '''
             # obs = poses_one_demo[j-obs_length+1:j+1, :].flatten()
-            obs = obs_obj
+            obs = obs_obj - object_pose_init
             
             # Add some noise
             # pos_noise = 0.1
@@ -317,12 +318,6 @@ if __name__ == "__main__":
         '''
         NOTE: now, look at both object poses and gripper poses
         '''
-        vis_demo_start = object_poses[vis_select_idx][0]
-        select_idx = select_closest_sample(global_label[:, :obs_dim], vis_demo_start)# The index of the starting location in global_label
-        # vis_demo_start = np.concatenate(
-        #     [gripper_poses[vis_select_idx][0], object_poses[vis_select_idx][0]])
-        # select_idx = select_closest_sample(global_label[:, :2 * obs_dim], vis_demo_start)# The index of the starting location in global_label
-        
         
         
         object_pose_test = object_poses[vis_select_idx]
@@ -360,13 +355,17 @@ if __name__ == "__main__":
     if args.visualization:
         frame_poses = []
         batch_size_sample = 1
-        global_label_sample = torch.tile(global_label[select_idx], (batch_size_sample, 1)) # (2 x obs_length x obs_dim)
-        local_label_sample = torch.tile(local_label[select_idx], (batch_size_sample, 1)).unsqueeze(1) # This is constant
+        
+        obj_pose_start = object_pose_test[0]
+        obs_obj_pose_start = np.stack((obj_pose_start, ) * obs_length, axis = 0).flatten()
+        # At the first step, always start at (0, 0, 0) for relative poses
+        global_label_sample = torch.tile(global_label[0], (batch_size_sample, 1)) # (2 x obs_length x obs_dim)
+        local_label_sample = torch.tile(local_label[0], (batch_size_sample, 1)).unsqueeze(1) # This is constant
 
         '''
         NOTE: now, consider the object pose & agent pose
         '''
-        obs_pose = global_label[select_idx][-obs_dim:]
+        obs_pose = torch.from_numpy(obj_pose_start.copy())
         # obs_pose = global_label[select_idx][-2 * obs_dim:].clone()
         steps = 0
         rewards_diff = []
@@ -437,9 +436,13 @@ if __name__ == "__main__":
                 last_object_pose[2] -= np.pi * 2
             elif last_object_pose[2] < -np.pi:
                 last_object_pose[2] += np.pi * 2
-            obs_object_pose = global_label_sample[0][obs_dim :]
+                
+            # Recover the relative pose into world pose for the objects
+            obs_object_pose = global_label_sample[0][obs_dim :] + obj_pose_start
             obs_object_pose = torch.concatenate((obs_object_pose, last_object_pose))
-            global_label_sample = obs_object_pose
+            
+            # Always record the relative pose
+            global_label_sample = obs_object_pose - obs_obj_pose_start
             
             obs_pose = last_object_pose.clone()
             

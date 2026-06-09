@@ -2006,50 +2006,50 @@ class Trainer1DCondRL(object):
         accelerator.print('training complete')
     
     
-    def train_dsrl(self):
-        """
-        The function to train a separate TD3 agent for the initial noise sampling
-        following the idea in DSRL paper: https://arxiv.org/pdf/2506.15799
-        """
-        accelerator = self.accelerator
-        device = accelerator.device
+    # def train_dsrl(self):
+    #     """
+    #     The function to train a separate TD3 agent for the initial noise sampling
+    #     following the idea in DSRL paper: https://arxiv.org/pdf/2506.15799
+    #     """
+    #     accelerator = self.accelerator
+    #     device = accelerator.device
         
-        # Obtain the dimension of state and action from the data
-        data = next(self.dl)
-        data, local_cond, global_cond = data
-        data = data.to(device)
-        if local_cond is not None: # local_cond here is zero (for optimality)
-            local_cond = local_cond.to(device)
-        if global_cond is not None:
-            global_cond = global_cond.to(device)
-        state_dim = global_cond.shape[-1]
-        action_dim = data.shape[1] * data.shape[2]  # D * T
-        self.td3_agent = TD3_DSRL(state_dim, action_dim, max_action=0.5, device=device)
-        print("Initialized TD3 agent for DSRL training. => check wandb for details")
+    #     # Obtain the dimension of state and action from the data
+    #     data = next(self.dl)
+    #     data, local_cond, global_cond = data
+    #     data = data.to(device)
+    #     if local_cond is not None: # local_cond here is zero (for optimality)
+    #         local_cond = local_cond.to(device)
+    #     if global_cond is not None:
+    #         global_cond = global_cond.to(device)
+    #     state_dim = global_cond.shape[-1]
+    #     action_dim = data.shape[1] * data.shape[2]  # D * T
+    #     self.td3_agent = TD3_DSRL(state_dim, action_dim, max_action=0.5, device=device)
+    #     print("Initialized TD3 agent for DSRL training. => check wandb for details")
 
-        while self.step < self.train_num_steps:
-            data = next(self.dl)
+    #     while self.step < self.train_num_steps:
+    #         data = next(self.dl)
             
-            # Different from traditional method, local_cond here 
-            # also describes the optimality of the state-action pair
-            data, local_cond, global_cond = data
-            data = data.to(device)
-            if local_cond is not None:
-                local_cond = local_cond.to(device)
-            if global_cond is not None:
-                global_cond = global_cond.to(device)
-            state = global_cond.clone()
-            noise_latent = torch.randn_like(data).to(device) # Flatten the noise latent for TD3 agent
-            action = self.model.sample(global_cond.shape[0], local_cond, global_cond, w_init = noise_latent)
-            reward = self.rewarding_model(state, action) # Obtain the reward from the rewarding model
-            self.td3_agent.train(state, noise_latent.flatten(start_dim=1), reward, wandb_logger=self.wandb_logger)
+    #         # Different from traditional method, local_cond here 
+    #         # also describes the optimality of the state-action pair
+    #         data, local_cond, global_cond = data
+    #         data = data.to(device)
+    #         if local_cond is not None:
+    #             local_cond = local_cond.to(device)
+    #         if global_cond is not None:
+    #             global_cond = global_cond.to(device)
+    #         state = global_cond.clone()
+    #         noise_latent = torch.randn_like(data).to(device) # Flatten the noise latent for TD3 agent
+    #         action = self.model.sample(global_cond.shape[0], local_cond, global_cond, w_init = noise_latent)
+    #         reward = self.rewarding_model(state, action) # Obtain the reward from the rewarding model
+    #         self.td3_agent.train(state, noise_latent.flatten(start_dim=1), reward, wandb_logger=self.wandb_logger)
                     
                 
-        print('training complete')
+    #     print('training complete')
     
-    def finetune_PPO(self):
+    def finetune_PPO(self, data):
         """
-        Finetune the diffusion model use PPO
+        Finetune the diffusion model use PPO based on the real-time observations
         """
         # Freeze the baseline diffusion model
         self.model_baseline.requires_grad_(False)
@@ -2057,12 +2057,12 @@ class Trainer1DCondRL(object):
         device = accelerator.device
 
         """
-        The crazy idea: test only one data sample!
-        If it still failed, then probably PPO loss is not calculated correctly?
+        Finetune the model using PPO algorithm,
+        The reward is from the naive reward model
         """
-        # data = next(self.ppo_dl)
-        # data, local_cond, global_cond = data
-        # data = data.to(device)
+
+        data, local_cond, global_cond = data
+        data = data.to(device)
         with tqdm(initial = self.PPO_step, total = self.PPO_train_num_steps, disable = not accelerator.is_main_process) as pbar:
             while self.PPO_step < self.PPO_train_num_steps:
                 self.model_baseline.eval()
@@ -2070,9 +2070,9 @@ class Trainer1DCondRL(object):
 
                 total_loss = 0.
                 for _ in range(self.gradient_accumulate_every):
-                    data = next(self.dl)
-                    data, local_cond, global_cond = data
-                    data = data.to(device)
+                    # data = next(self.dl)
+                    # data, local_cond, global_cond = data
+                    # data = data.to(device)
 
                     # Stack the global_cond
                     with self.accelerator.autocast():
@@ -2087,9 +2087,7 @@ class Trainer1DCondRL(object):
                                 self.model_baseline.sample_verbose(global_cond.shape[0] * batch_size_sample, local_cond_sample, global_cond_sample)
                             action_length = self.model.action_length
                             reward_scores = self.rewarding_model(global_cond_sample, img[:, :, :action_length])
-                            # print("Reward scores std: ", reward_scores.std().item())
-                            # print("Reward scores mean: ", reward_scores.mean().item())
-                            # exit(0)
+
                             # Size of reward_scores: (bs, 1) => (bs, )
                             reward_scores = torch.Tensor(reward_scores).squeeze(-1).to(self.accelerator.device)
                             # avg_reward_step = all_rewards_valid.mean().item() /self.gradient_accumulate_every
@@ -2138,48 +2136,48 @@ class Trainer1DCondRL(object):
                 if accelerator.is_main_process:
                     self.ema.update()
 
-                    if self.PPO_step != 0 and self.PPO_step % self.reward_sample_ppo_every == 0 \
-                        and self.wandb_logger is not None:
-                        self.ema.ema_model.eval()
+                    # if self.PPO_step != 0 and self.PPO_step % self.reward_sample_ppo_every == 0 \
+                    #     and self.wandb_logger is not None:
+                    #     self.ema.ema_model.eval()
 
-                        with torch.no_grad():
-                            data = next(self.dl)
-                            data, local_cond, global_cond = data
-                            data = data.to(device)
-                            batch_size_sample = 32
-                            local_cond_sample = torch.repeat_interleave(local_cond, repeats=batch_size_sample, dim=0) # For the local_cond, only to stack them
-                            global_cond_sample = torch.repeat_interleave(global_cond, repeats=batch_size_sample, dim=0)
-                            data_sample = torch.repeat_interleave(data, repeats=batch_size_sample, dim=0)
-                            # Sample a batch of data using the latest policy
-                            img_new, img_lst, img_next_lst, ts_lst, log_probs_lst = \
-                                self.model.sample_verbose(global_cond.shape[0] * batch_size_sample, local_cond_sample, global_cond_sample)
-                            reward_scores_new = self.rewarding_model(global_cond_sample, img_new)
+                    #     with torch.no_grad():
+                    #         data = next(self.dl)
+                    #         data, local_cond, global_cond = data
+                    #         data = data.to(device)
+                    #         batch_size_sample = 32
+                    #         local_cond_sample = torch.repeat_interleave(local_cond, repeats=batch_size_sample, dim=0) # For the local_cond, only to stack them
+                    #         global_cond_sample = torch.repeat_interleave(global_cond, repeats=batch_size_sample, dim=0)
+                    #         data_sample = torch.repeat_interleave(data, repeats=batch_size_sample, dim=0)
+                    #         # Sample a batch of data using the latest policy
+                    #         img_new, img_lst, img_next_lst, ts_lst, log_probs_lst = \
+                    #             self.model.sample_verbose(global_cond.shape[0] * batch_size_sample, local_cond_sample, global_cond_sample)
+                    #         reward_scores_new = self.rewarding_model(global_cond_sample, img_new)
                             
                             
-                            reward_new = reward_scores_new.mean().item()
-                             # Sample a batch of data using the baseline policy
-                            img, img_lst, img_next_lst, ts_lst, log_probs_lst = \
-                                self.model_baseline.sample_verbose(global_cond.shape[0] * batch_size_sample, local_cond_sample, global_cond_sample)
-                            reward_scores = self.rewarding_model(global_cond_sample, img)
-                            self.wandb_logger.log({"PPO Sampled Reward (Mean, baseline - new)": reward_scores.mean().item() - reward_new})
-                            self.wandb_logger.log({"PPO Sampled Reward (baseline)": reward_scores.mean().item() + 0.1 * np.exp(1.4)}) # Offset for advantage
-                            self.wandb_logger.log({"PPO Sampled Reward (new)": reward_new + 0.1 * np.exp(1.4)}) # Offset for advantage
-                            self.wandb_logger.log({"PPO Sampled Reward (Std, new)": reward_scores_new.std().item()})
-                            self.wandb_logger.log({"PPO Sampled Reward (Std, baseline)": reward_scores.std().item()})
-                            # Update the baseline model to the new model
-                            # model_baseline = self.accelerator.unwrap_model(self.model_baseline)
-                            # model = self.accelerator.unwrap_model(self.model)
-                            # model_baseline.load_state_dict(model.state_dict())
-                    # baseline_update_every = 50 * self.reward_sample_ppo_every
-                    # if self.PPO_step !=0 and self.PPO_step % baseline_update_every == 0:
-                    #     # Update the baseline model to the new model
-                    #     model_baseline = self.accelerator.unwrap_model(self.model_baseline)
-                    #     model = self.accelerator.unwrap_model(self.model)
-                    #     model_baseline.load_state_dict(model.state_dict())    
+                    #         reward_new = reward_scores_new.mean().item()
+                    #          # Sample a batch of data using the baseline policy
+                    #         img, img_lst, img_next_lst, ts_lst, log_probs_lst = \
+                    #             self.model_baseline.sample_verbose(global_cond.shape[0] * batch_size_sample, local_cond_sample, global_cond_sample)
+                    #         reward_scores = self.rewarding_model(global_cond_sample, img)
+                    #         self.wandb_logger.log({"PPO Sampled Reward (Mean, baseline - new)": reward_scores.mean().item() - reward_new})
+                    #         self.wandb_logger.log({"PPO Sampled Reward (baseline)": reward_scores.mean().item() + 0.1 * np.exp(1.4)}) # Offset for advantage
+                    #         self.wandb_logger.log({"PPO Sampled Reward (new)": reward_new + 0.1 * np.exp(1.4)}) # Offset for advantage
+                    #         self.wandb_logger.log({"PPO Sampled Reward (Std, new)": reward_scores_new.std().item()})
+                    #         self.wandb_logger.log({"PPO Sampled Reward (Std, baseline)": reward_scores.std().item()})
+                    #         # Update the baseline model to the new model
+                    #         # model_baseline = self.accelerator.unwrap_model(self.model_baseline)
+                    #         # model = self.accelerator.unwrap_model(self.model)
+                    #         # model_baseline.load_state_dict(model.state_dict())
+                    # # baseline_update_every = 50 * self.reward_sample_ppo_every
+                    # # if self.PPO_step !=0 and self.PPO_step % baseline_update_every == 0:
+                    # #     # Update the baseline model to the new model
+                    # #     model_baseline = self.accelerator.unwrap_model(self.model_baseline)
+                    # #     model = self.accelerator.unwrap_model(self.model)
+                    # #     model_baseline.load_state_dict(model.state_dict())    
                 pbar.update(1)
 
-        accelerator.print('PPO training complete')
-        self.PPO_step = 0
+        accelerator.print('PPO finetuning complete')
+        # self.PPO_step = 0
         
     def finetune_PPOD(self):
         """
